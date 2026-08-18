@@ -1,75 +1,105 @@
 # BeauQuot
 
-Telegram quote bot focused on high-quality inspirational posts and cinematic, text-free image generation.
+Telegram-бот для публикации качественных вдохновляющих цитат с кинематографичными изображениями без текста.
 
-## Features
+## Возможности
 
-- Curated quote selection with quality scoring and duplicate protection.
-- Topic and mood analysis to route quotes into different visual concepts.
-- Diverse visual archetypes to avoid repetitive `woman + flowers + golden light` imagery.
-- Cinematic editorial image prompts with an explicit text ban.
-- Multiple image-generation attempts with optional OCR rejection of obvious text artifacts.
-- Free-first Pollinations image generation; an API key can be supplied through the environment when available.
-- Russian translation fallback via Google Translate web endpoint and MyMemory.
-- SQLite publication history and visual diversity history.
-- Telegram admin controls and configurable auto-posting interval.
+- Отбор цитат с оценкой качества и защитой от дублей.
+- Анализ темы и настроения цитаты для выбора подходящей визуальной концепции.
+- Разнообразные визуальные архетипы, чтобы изображения не сводились к одному шаблону вроде `женщина + цветы + золотой свет`.
+- Кинематографичные редакционные промпты для генерации изображений с явным запретом на текст.
+- Несколько попыток генерации изображения с дополнительной проверкой через OCR на наличие очевидных текстовых артефактов.
+- Генерация изображений через Pollinations с приоритетом бесплатного режима; при необходимости можно указать API-ключ через переменную окружения.
+- Перевод на русский язык через Google Translate с запасным вариантом через MyMemory.
+- История публикаций и визуального разнообразия хранится в SQLite.
+- Административное управление через Telegram и настройка интервала автоматических публикаций.
 
-## Requirements
+## Требования
 
-Python 3.10+ is recommended.
+Рекомендуется Python 3.10 или новее.
 
-Install dependencies:
+Установите зависимости:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-`pytesseract` additionally needs the Tesseract OCR executable installed on the host if you want the optional OCR quality gate to run. If Tesseract is unavailable, the bot continues without OCR rejection.
+Для дополнительной проверки изображений через `pytesseract` на сервере должен быть установлен исполняемый файл Tesseract OCR. Если Tesseract недоступен, бот продолжит работу без OCR-проверки.
 
-## Configuration
+## Настройка
 
-Create a `.env` file locally or provide environment variables through your deployment platform:
+Создайте локальный файл `.env` или передайте переменные окружения через платформу, на которой запускается бот:
 
 ```env
-TELEGRAM_BOT_TOKEN=your_bot_token
+TELEGRAM_BOT_TOKEN=ваш_токен_бота
 TELEGRAM_CHANNEL_ID=@BeauQuot
 ADMIN_CHAT_ID=0
 POLLINATIONS_API_KEY=
 ```
 
-Do **not** commit `.env`, tokens, API keys, databases, generated configuration, or admin ID files.
+**Не добавляйте в Git:** `.env`, токены, API-ключи, базы данных, автоматически создаваемые конфигурационные файлы и файлы с ID администратора.
 
-Optional variables include:
+### Дополнительные переменные
 
-- `DB_FILE`
-- `CONFIG_FILE`
-- `ADMIN_ID_FILE`
-- `QUOTE_CORPUS_FILE`
-- `QUOTE_CORPUS_URL`
-- `IMAGE_TIMEOUT`
-- `LEXICAL_DUP_THRESHOLD`
-- `SEMANTIC_DUP_THRESHOLD`
-- `RECENT_DIVERSITY_WINDOW`
-- `EMBEDDING_MODEL`
+Можно настроить следующие параметры:
 
-## Run
+- `DB_FILE` — путь к SQLite-базе.
+- `CONFIG_FILE` — файл конфигурации бота.
+- `ADMIN_ID_FILE` — файл с ID администратора.
+- `QUOTE_CORPUS_FILE` — локальный файл с корпусом цитат.
+- `QUOTE_CORPUS_URL` — URL для загрузки корпуса цитат.
+- `IMAGE_TIMEOUT` — тайм-аут генерации изображения.
+- `LEXICAL_DUP_THRESHOLD` — порог лексического сходства для защиты от дублей.
+- `SEMANTIC_DUP_THRESHOLD` — порог семантического сходства.
+- `RECENT_DIVERSITY_WINDOW` — количество последних публикаций, учитываемых при выборе разнообразных визуальных концепций.
+- `EMBEDDING_MODEL` — модель эмбеддингов, если она используется в текущей конфигурации.
+
+## Запуск
 
 ```bash
 python main.py
 ```
 
-The first `/start` initializes the first Telegram admin when no admin ID has been configured yet.
+При первом использовании `/start`, если ID администратора ещё не настроен, бот назначит первого пользователя администратором.
 
-## Repair an already published quote
+## Исправление уже опубликованной цитаты
+
+Если нужно заново обработать уже опубликованную цитату:
 
 ```bash
-python main.py repair-published "QUOTE TEXT" "AUTHOR"
+python main.py repair-published "ТЕКСТ ЦИТАТЫ" "АВТОР"
 ```
 
-## Image pipeline
+## Как работает генерация изображений
 
-The image prompt deliberately does not include the quote itself. The generator is instructed to communicate the emotional thesis visually and to avoid text-bearing objects, typography, logos, signs, screens, posters, and other common sources of unwanted text. The pipeline then validates the returned image and, when OCR is available, rejects obvious text artifacts and retries.
+Текст самой цитаты намеренно не передаётся в промпт изображения. Вместо этого бот определяет эмоциональную и смысловую основу цитаты и превращает её в визуальную сцену.
 
-## Security
+Генератор получает инструкции избегать:
 
-Secrets are read from environment variables only. Keep production credentials in the deployment platform's secret manager rather than in Git.
+- текста и надписей;
+- букв и цифр;
+- типографики;
+- водяных знаков и логотипов;
+- вывесок и плакатов;
+- экранов и телефонов с текстом;
+- книг, документов, меню и других объектов с надписями.
+
+После получения изображения бот проверяет результат. Если доступен OCR, изображения с очевидными текстовыми артефактами отклоняются и запускается повторная генерация.
+
+## Безопасность
+
+Секреты считываются только из переменных окружения. Рабочие токены и API-ключи не должны храниться в Git-репозитории. Для production рекомендуется использовать секреты платформы, на которой развёрнут бот.
+
+## Структура проекта
+
+```text
+BeauQuot/
+├── main.py
+├── requirements.txt
+├── README.md
+└── .gitignore
+```
+
+## Лицензия
+
+В репозитории пока не задана отдельная лицензия. Если проект будет публиковаться для свободного использования, рекомендуется добавить подходящую лицензию отдельным коммитом.
