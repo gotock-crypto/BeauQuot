@@ -3,3 +3,4 @@ requests>=2.31,<3
 python-dotenv>=1.0,<2
 Pillow>=10,<13
 pytesseract>=0.3.10,<1
+huggingface_hub>=0.34.4,<1
