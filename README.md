@@ -2,110 +2,109 @@
 
 Telegram-бот для публикации качественных вдохновляющих цитат с кинематографичными изображениями без текста.
 
-## Текущая версия
+## Текущая production-версия
 
 **Visual Engine 3.1.6**.
 
-3.1.6 сохраняет semantic art direction 3.1.4 и использует **AI Horde + Flux.1-Schnell fp8 (Compact)** для бесплатной генерации изображений. Для anonymous/free режима запрос изображения выполняется в **1024×1024**, после чего результат нормализуется локально перед OCR и публикацией.
+Production 3.1.6 использует **AI Horde + Flux.1-Schnell fp8 (Compact)** для бесплатной генерации изображений. Для anonymous/free режима изображение запрашивается в **1024×1024**, затем локально нормализуется до квадрата перед OCR/semantic validation и публикацией.
+
+### Pipeline
+
+```text
+quote
+→ topic / mood
+→ semantic art direction
+→ AI Horde / Flux Schnell 1024×1024
+→ local square normalization
+→ OCR / semantic validation
+→ Telegram publication
+```
 
 ## Возможности
 
-- Отбор цитат с оценкой качества и защитой от дублей.
-- Анализ темы и настроения цитаты.
-- Semantic art direction перед генерацией изображения.
-- Temporal semantic composition для цитат с несколькими логическими или временными состояниями.
-- Разнообразные визуальные архетипы, чтобы изображения не сводились к одному шаблону.
-- Кинематографичные редакционные промпты с явным запретом на текст.
-- Несколько попыток генерации изображения с дополнительной проверкой через OCR, если OCR доступен.
-- Генерация изображений через бесплатную volunteer-сеть AI Horde с Flux.1-Schnell fp8 (Compact).
-- Локальная нормализация/квадратирование изображения перед проверками и публикацией.
-- Hugging Face не используется как image provider.
-- История публикаций и визуального разнообразия хранится в SQLite.
-- Административное управление через Telegram и настройка интервала автоматических публикаций.
+- отбор цитат с оценкой качества и защитой от дублей;
+- анализ темы и настроения;
+- semantic art direction;
+- temporal semantic composition;
+- разнообразные визуальные архетипы;
+- кинематографичные промпты с запретом текста;
+- несколько попыток генерации изображения;
+- OCR-проверка при наличии Tesseract;
+- бесплатная генерация через volunteer-сеть AI Horde;
+- локальная нормализация изображения 1024×1024;
+- SQLite-история публикаций и визуального разнообразия;
+- Telegram-управление и автопостинг.
 
-## Semantic art direction
+## HF
 
-Для цитат с временной или причинной структурой аналитик может определить:
+**Hugging Face не используется как image provider.**
 
-- `clause_count`;
-- `temporal_composition`: `none`, `before_after` или `past_present_future`;
-- `temporal_beats`.
-
-Если требуется `past_present_future`, визуальная концепция должна содержать три смысловых beat-а внутри одной непрерывной сцены.
-
-Запрещены split-screen, триптихи, панели, инфографика и буквальная timeline-графика.
-
-## Требования
-
-Рекомендуется Python 3.10 или новее.
-
-Установите зависимости из `requirements.txt`.
-
-Для OCR на сервере должен быть установлен Tesseract OCR. Если Tesseract недоступен, бот продолжит работу без OCR-проверки.
+В production 3.1.6 Hugging Face всё ещё может использоваться отдельными компонентами semantic analysis / visual judging. Это не относится к генерации изображений.
 
 ## Настройка
 
-Создайте локальный `.env` или передайте переменные окружения:
-
 ```env
-TELEGRAM_BOT_TOKEN=ваш_токен_бота
+TELEGRAM_BOT_TOKEN=...
 TELEGRAM_CHANNEL_ID=@BeauQuot
-ADMIN_CHAT_ID=0
+ADMIN_CHAT_ID=...
 
 AIHORDE_API_KEY=0000000000
 AIHORDE_IMAGE_MODEL=Flux.1-Schnell fp8 (Compact)
 AIHORDE_IMAGE_WIDTH=1024
 AIHORDE_IMAGE_HEIGHT=1024
+AIHORDE_IMAGE_STEPS=4
+AIHORDE_IMAGE_CFG=1
+AIHORDE_IMAGE_SAMPLER=k_euler
+AIHORDE_IMAGE_TIMEOUT=360
+AIHORDE_POLL_INTERVAL=5
 
 TEMPORAL_COMPOSITION_ENABLED=1
 TEMPORAL_COMPOSITION_MIN_CLAUSES=2
 ```
 
-`AIHORDE_API_KEY=0000000000` используется для anonymous/free режима. При наличии собственного AI Horde key его можно указать вместо anonymous key.
+`AIHORDE_API_KEY=0000000000` — anonymous/free режим с низшим приоритетом очереди. Личный AI Horde key не обязателен.
 
-**Не добавляйте в Git:** `.env`, токены, API-ключи, базы данных и автоматически создаваемые runtime-файлы.
+Не коммитьте `.env`, Telegram-токены, API-ключи, SQLite и логи.
 
-## Как работает генерация
+## Требования
 
-Текст самой цитаты не передаётся непосредственно в prompt изображения. Сначала определяется эмоциональная и смысловая основа, затем формируется визуальная сцена.
+- Python 3.10+;
+- `requirements.txt`;
+- Tesseract OCR — необязательно, если нужна OCR-проверка.
 
-Генератор получает строгий запрет на:
+## Production snapshot
 
-- текст и надписи;
-- буквы и цифры;
-- типографику;
-- водяные знаки и логотипы;
-- вывески и плакаты;
-- экраны и телефоны с текстом;
-- книги, документы, меню и другие объекты с надписями;
-- split-screen, триптихи и визуальные панели для temporal composition.
+Точный архив, использованный для production 3.1.6:
 
-AI Horde получает квадратный запрос 1024×1024. Полученное изображение локально нормализуется перед OCR/semantic validation и публикацией.
+`quote-bot-v3.1.6-free-image-square.tar.gz`
 
-## Production
+SHA-256:
 
-Текущая рабочая версия развернута как systemd-сервис `quote-bot.service`.
+`df1f493cbf8c37825d2bc18eb58036a3e0280b266dfeffb8c93a51a466f17d2d`
 
-Перед обновлением production необходимо сделать backup, остановить сервис, распаковать архив, выполнить `py_compile` и только затем запустить сервис.
+Подробности: `PRODUCTION_3_1_6.md`.
+
+## Обновление production
+
+```bash
+systemctl stop quote-bot.service
+cd /opt/quote-bot
+tar -czf /root/quote-bot-backup-$(date +%Y%m%d-%H%M%S).tar.gz --exclude='venv' .
+tar -xzf /root/quote-bot-v3.1.6-free-image-square.tar.gz -C /
+/opt/quote-bot/venv/bin/python3 -m py_compile /opt/quote-bot/main.py
+systemctl start quote-bot.service
+systemctl status quote-bot.service --no-pager -l
+```
+
+Логи:
+
+```bash
+journalctl -u quote-bot.service -f
+```
 
 ## Безопасность
 
-Секреты считываются только из переменных окружения. Рабочие токены и API-ключи не должны храниться в Git-репозитории.
-
-## Статус 3.1.6
-
-В production подтвержден полный цикл:
-
-```text
-quote
-→ semantic/art direction
-→ AI Horde Flux Schnell 1024×1024
-→ local normalization
-→ OCR/validation
-→ Telegram publication
-```
-
-AI Horde может работать медленно при высокой нагрузке на сеть, но это приемлемо для текущего расписания публикаций.
+Секреты считываются только из environment. Если токен или API-ключ был раскрыт, его необходимо отозвать и перевыпустить.
 
 ## Лицензия
 
