@@ -1,111 +1,130 @@
 # BeauQuot
 
-Telegram-бот для публикации качественных вдохновляющих цитат с кинематографичными изображениями без текста.
+**AI Content Automation Platform** — автоматизированный pipeline для отбора, смыслового анализа, визуализации, валидации и публикации контента.
 
-## Текущая production-версия
+## Что делает проект
 
-**Visual Engine 3.1.6**.
+BeauQuot превращает исходную цитату в готовый визуальный контент и автоматически проходит production-процесс: от выбора и анализа цитаты до генерации изображения, quality checks и публикации.
 
-Production 3.1.6 использует **AI Horde + Flux.1-Schnell fp8 (Compact)** для бесплатной генерации изображений. В anonymous/free режиме изображение запрашивается в **1024×1024**, затем локально нормализуется до квадрата перед OCR/semantic validation и публикацией.
+Основной контур:
 
-### Pipeline
+    quote
+    → quality / duplicate checks
+    → topic / mood analysis
+    → semantic art direction
+    → AI image generation
+    → local normalization
+    → OCR / semantic validation
+    → visual history / deduplication
+    → publication
 
-```text
-quote
-→ topic / mood
-→ semantic art direction
-→ AI Horde / Flux Schnell 1024×1024
-→ local square normalization
-→ OCR / semantic validation
-→ Telegram publication
-```
+## Основные возможности
 
-## Возможности
-
-- отбор цитат с оценкой качества и защитой от дублей;
-- анализ темы и настроения;
-- semantic art direction;
+- корпус цитат с quality scoring и защитой от повторного использования;
+- тематический и эмоциональный анализ;
+- semantic art direction перед генерацией изображения;
 - temporal semantic composition;
-- разнообразные визуальные архетипы;
-- кинематографичные промпты с запретом текста;
-- несколько попыток генерации изображения;
-- OCR-проверка при наличии Tesseract;
-- бесплатная генерация через volunteer-сеть AI Horde;
-- локальная нормализация изображения 1024×1024;
-- SQLite-история публикаций и визуального разнообразия;
-- Telegram-управление и автопостинг.
+- управление визуальными архетипами и разнообразием контента;
+- генерация изображений через AI Horde / Flux.1-Schnell;
+- несколько попыток генерации с обработкой ошибок;
+- локальная нормализация изображений;
+- OCR-проверка на наличие нежелательного текста;
+- semantic validation визуального результата;
+- SQLite для хранения состояния, истории публикаций и визуального разнообразия;
+- Telegram-управление и автоматический scheduler;
+- retry/fallback и runtime diagnostics.
 
-## Hugging Face
+## Production image pipeline
 
-**Hugging Face не используется как image provider.**
+Текущая production-версия репозитория — **Visual Engine 3.1.6**.
 
-В production 3.1.6 Hugging Face всё ещё может использоваться отдельными компонентами semantic analysis / visual judging. Это не относится к генерации изображений.
+Для генерации изображений используется **AI Horde + Flux.1-Schnell fp8 (Compact)**. В anonymous/free режиме изображение запрашивается в 1024×1024 и затем локально нормализуется перед последующими проверками и публикацией.
 
-## Настройка
+**Hugging Face не является image provider.** Он может использоваться отдельными компонентами semantic analysis / visual judging.
 
-```env
-TELEGRAM_BOT_TOKEN=...
-TELEGRAM_CHANNEL_ID=@BeauQuot
-ADMIN_CHAT_ID=...
+## Архитектура
 
-AIHORDE_API_KEY=0000000000
-AIHORDE_IMAGE_MODEL=Flux.1-Schnell fp8 (Compact)
-AIHORDE_IMAGE_WIDTH=1024
-AIHORDE_IMAGE_HEIGHT=1024
-AIHORDE_IMAGE_STEPS=4
-AIHORDE_IMAGE_CFG=1
-AIHORDE_IMAGE_SAMPLER=k_euler
-AIHORDE_IMAGE_TIMEOUT=360
-AIHORDE_POLL_INTERVAL=5
+Проект построен вокруг последовательного AI workflow с сохранением состояния:
 
-TEMPORAL_COMPOSITION_ENABLED=1
-TEMPORAL_COMPOSITION_MIN_CLAUSES=2
-```
+- content selection;
+- semantic analysis;
+- visual concept generation;
+- image generation;
+- image validation;
+- duplicate / diversity checks;
+- publication.
 
-`AIHORDE_API_KEY=0000000000` — anonymous/free режим с низшим приоритетом очереди. Личный AI Horde key не обязателен.
+SQLite используется как persistent state layer для истории контента, публикаций и визуальной памяти.
 
-Не коммитьте `.env`, Telegram-токены, API-ключи, SQLite и логи.
+## Стек
 
-## Требования
+- Python 3.10+
+- SQLite
+- AI Horde
+- Flux.1-Schnell
+- Hugging Face
+- Telegram Bot API
+- Pillow
+- pytesseract / Tesseract OCR
+- REST API
+- systemd
+- Linux / VPS
+- environment-based configuration
+- logging / runtime diagnostics
 
-- Python 3.10+;
-- зависимости из `requirements.txt`;
-- Tesseract OCR — необязательно, если нужна OCR-проверка.
+## Production
 
-## Production snapshot
+Production snapshot:
 
-Точный архив, использованный для production 3.1.6:
-
-`quote-bot-v3.1.6-free-image-square.tar.gz`
+quote-bot-v3.1.6-free-image-square.tar.gz
 
 SHA-256:
 
-`df1f493cbf8c37825d2bc18eb58036a3e0280b266dfeffb8c93a51a466f17d2d`
+df1f493cbf8c37825d2bc18eb58036a3e0280b266dfeffb8c93a51a466f17d2d
 
-Подробности: `PRODUCTION_3_1_6.md`.
+## Configuration
 
-## Обновление production
+Secrets and credentials are read from environment variables.
 
-```bash
-systemctl stop quote-bot.service
-cd /opt/quote-bot
-tar -czf /root/quote-bot-backup-$(date +%Y%m%d-%H%M%S).tar.gz --exclude='venv' .
-tar -xzf /root/quote-bot-v3.1.6-free-image-square.tar.gz -C /
-/opt/quote-bot/venv/bin/python3 -m py_compile /opt/quote-bot/main.py
-systemctl start quote-bot.service
-systemctl status quote-bot.service --no-pager -l
-```
+Example:
 
-Логи:
+    TELEGRAM_BOT_TOKEN=...
+    TELEGRAM_CHANNEL_ID=@BeauQuot
+    ADMIN_CHAT_ID=...
 
-```bash
-journalctl -u quote-bot.service -f
-```
+    AIHORDE_API_KEY=0000000000
+    AIHORDE_IMAGE_MODEL=Flux.1-Schnell fp8 (Compact)
+    AIHORDE_IMAGE_WIDTH=1024
+    AIHORDE_IMAGE_HEIGHT=1024
+    AIHORDE_IMAGE_STEPS=4
+    AIHORDE_IMAGE_CFG=1
+    AIHORDE_IMAGE_SAMPLER=k_euler
+    AIHORDE_IMAGE_TIMEOUT=360
+    AIHORDE_POLL_INTERVAL=5
 
-## Безопасность
+Не коммитьте .env, токены, API-ключи, SQLite-файлы и runtime logs.
 
-Секреты считываются только из environment. Если токен или API-ключ был раскрыт, его необходимо отозвать и перевыпустить.
+## Deployment
 
-## Лицензия
+Проект рассчитан на работу как долгоживущий сервис под Linux/systemd.
 
-В репозитории пока не задана отдельная лицензия.
+Пример базового цикла обновления:
+
+    systemctl stop quote-bot.service
+    cd /opt/quote-bot
+    tar -czf /root/quote-bot-backup-$(date +%Y%m%d-%H%M%S).tar.gz --exclude='venv' .
+    /opt/quote-bot/venv/bin/python3 -m py_compile /opt/quote-bot/main.py
+    systemctl start quote-bot.service
+    systemctl status quote-bot.service --no-pager -l
+
+Logs:
+
+    journalctl -u quote-bot.service -f
+
+## Project
+
+BeauQuot is a practical example of an AI-assisted content automation system combining semantic processing, image generation, validation, persistent state and automated publishing.
+
+## License
+
+The repository currently does not declare a separate project license.
