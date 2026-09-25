@@ -1,0 +1,3 @@
+"""Autonomous publication contract: every noncritical stage has a fallback."""
+STAGES=("fetch","validate_source","translate","visual_concept","generate_image","validate_image","prepare_social","format","publish_telegram","publish_max","publish_youtube","cleanup_media","save_state")
+FALLBACKS={"generate_image":("retry_until_gigachat_success",),"prepare_social":("validated_original",),"publish_telegram":("retry","text_only"),"publish_max":("retry","independent_continue"),"publish_youtube":("retry","independent_continue"),"cleanup_media":("finally_delete",),"save_state":("log_and_continue",)}
