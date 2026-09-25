@@ -1,0 +1,25 @@
+# Secrets
+.env
+.env.*
+!.env.example
+*_token.json
+*client_secret*.json
+*credentials*.json
+*secret*.json
+
+# Runtime / state
+quotes.db
+*.db
+runtime/
+persistent/
+backups/
+venv/
+__pycache__/
+*.pyc
+*.log
+*.mp4
+
+# Local backups / snapshots
+*.before*
+*.bak*
+*.backup*
