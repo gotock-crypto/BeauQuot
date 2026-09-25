@@ -121,6 +121,21 @@ Logs:
 
     journalctl -u quote-bot.service -f
 
+## Repository hygiene
+
+The repository excludes secrets, credentials, SQLite runtime state, local virtual environments, backups, logs and generated media. Use `.env.example` for configuration templates.
+
+## Source layout
+
+- `main.py` — orchestration and Telegram admin flow;
+- `youtube/` — independent YouTube Shorts pipeline;
+- `media/` — validated static-image preparation;
+- `publishers/` — platform formatting;
+- `max/` — MAX publishing adapter;
+- `validators/` — publication quality gates;
+- `core/` — pipeline contracts;
+- `quotes_corpus.json` — source quote corpus.
+
 ## Project
 
 BeauQuot is a practical example of an AI-assisted content automation system combining semantic processing, image generation, validation, persistent state and automated publishing.
