@@ -1,0 +1,11 @@
+{
+  "social_interval_hours": 3,
+  "youtube_interval_hours": 6,
+  "auto_social_posting": true,
+  "auto_youtube_posting": true,
+  "last_social_post_time": "2026-09-23T11:30:36.338234",
+  "last_youtube_post_time": "2026-09-23T06:06:32.530401",
+  "interval_hours": 3,
+  "auto_posting": true,
+  "last_post_time": "2026-09-23T11:30:36.338234"
+}
