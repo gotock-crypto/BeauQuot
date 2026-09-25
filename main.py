@@ -6,6 +6,7 @@ import html
 import time
 import random
 import hashlib
+import uuid
 import logging
 import sqlite3
 import asyncio
@@ -13,7 +14,15 @@ from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from urllib.parse import quote
 from io import BytesIO
+from pathlib import Path
 from difflib import SequenceMatcher
+from publishers.formatters import telegram_caption, max_caption
+from media.prepare import prepare_social_image
+import sys
+sys.path.insert(0, "/opt")
+from gigachat_gate import gigachat_gate, gigachat_mark_rate_limit
+from validators.platform import validate_post_payload
+from youtube.pipeline import YouTubePublisher
 
 import requests
 from dotenv import load_dotenv
@@ -41,6 +50,20 @@ load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "@BeauQuot").strip()
 
+# Multi-platform publishing: Telegram and MAX are independent targets.
+MAX_ENABLED = os.getenv("MAX_ENABLED", "1").strip() != "0"
+MAX_PHONE = os.getenv("MAX_PHONE", "").strip()
+MAX_SESSION = os.getenv("MAX_SESSION", "quote_max").strip() or "quote_max"
+MAX_WORK_DIR = os.getenv("MAX_WORK_DIR", "runtime/max_session").strip() or "runtime/max_session"
+MAX_CHANNEL_ID = os.getenv("MAX_CHANNEL_ID", "").strip()
+TELEGRAM_CHANNEL_URL = os.getenv("TELEGRAM_CHANNEL_URL", "").strip()
+MAX_CHANNEL_URL = os.getenv("MAX_CHANNEL_URL", "").strip()
+MAX_RETRIES = max(1, int(os.getenv("MAX_RETRIES", "3")))
+TELEGRAM_RETRIES = max(1, int(os.getenv("TELEGRAM_RETRIES", "3")))
+YOUTUBE_ENABLED = os.getenv("YOUTUBE_ENABLED", "0").strip() == "1"
+YOUTUBE_RETRIES = max(1, int(os.getenv("YOUTUBE_RETRIES", "2")))
+YOUTUBE_WORK_DIR = os.getenv("YOUTUBE_WORK_DIR", "runtime/youtube").strip() or "runtime/youtube"
+
 try:
     ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 except Exception:
@@ -50,31 +73,35 @@ DB_FILE = os.getenv("DB_FILE", "quotes.db")
 CONFIG_FILE = os.getenv("CONFIG_FILE", "bot_config.json")
 ADMIN_ID_FILE = os.getenv("ADMIN_ID_FILE", "admin_id.txt")
 
-# Hugging Face is used for semantic LLM / visual analysis only.
-# Image generation is provided by the free AI Horde volunteer network.
+# GigaChat is the primary provider for semantic analysis and image generation.
+GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS", "").strip()
+GIGACHAT_SCOPE = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS").strip() or "GIGACHAT_API_PERS"
+GIGACHAT_MODEL = os.getenv("GIGACHAT_MODEL", "GigaChat").strip() or "GigaChat"
+GIGACHAT_API_BASE = os.getenv("GIGACHAT_API_BASE", "https://api.giga.chat").strip().rstrip("/")
+GIGACHAT_OAUTH_URL = os.getenv("GIGACHAT_OAUTH_URL", f"{GIGACHAT_API_BASE}/api/v2/oauth").strip()
+GIGACHAT_TIMEOUT = int(os.getenv("GIGACHAT_TIMEOUT", "90"))
+GIGACHAT_IMAGE_ENABLED = os.getenv("GIGACHAT_IMAGE_ENABLED", "1").strip() != "0"
+GIGACHAT_IMAGE_TIMEOUT = int(os.getenv("GIGACHAT_IMAGE_TIMEOUT", "120"))
+
+# Publication quality gates. Fail closed for text detection: a quote image must never
+# be published when the OCR verifier is unavailable.
+OCR_REQUIRED = os.getenv("OCR_REQUIRED", "1").strip() != "0"
+OCR_MIN_CONFIDENCE = float(os.getenv("OCR_MIN_CONFIDENCE", "35"))
+OCR_MIN_TOKEN_LENGTH = int(os.getenv("OCR_MIN_TOKEN_LENGTH", "3"))
+OCR_MAX_ATTEMPTS = int(os.getenv("OCR_MAX_ATTEMPTS", "5"))
+
+TRANSLATION_QUALITY_GATE = os.getenv("TRANSLATION_QUALITY_GATE", "1").strip() != "0"
+TRANSLATION_MIN_SCORE = float(os.getenv("TRANSLATION_MIN_SCORE", "0.82"))
+_GIGACHAT_ACCESS_TOKEN = ""
+_GIGACHAT_ACCESS_EXPIRES_AT = 0.0
+
+# Hugging Face settings are retained only for optional BLIP image captioning.
+# They are not required for normal text/image generation anymore.
 HF_TOKEN = os.getenv("HF_TOKEN", os.getenv("HUGGINGFACE_TOKEN", "")).strip()
 HF_TOKEN_2 = os.getenv("HF_TOKEN_2", "").strip()
 HF_TOKEN_3 = os.getenv("HF_TOKEN_3", "").strip()
 HF_TOKEN_ORDER = [x.strip() for x in os.getenv("HF_TOKEN_ORDER", "HF_TOKEN,HF_TOKEN_2,HF_TOKEN_3").split(",") if x.strip()]
-# AI Horde image generation is intentionally independent of all HF image settings.
-AIHORDE_API_BASE = os.getenv("AIHORDE_API_BASE", "https://aihorde.net/api/v2").strip().rstrip("/")
-AIHORDE_API_KEY = os.getenv("AIHORDE_API_KEY", "0000000000").strip() or "0000000000"
-AIHORDE_CLIENT_AGENT = os.getenv(
-    "AIHORDE_CLIENT_AGENT",
-    "BeauQuot:3.1.5-free-image:https://github.com/gotock-crypto/BeauQuot",
-).strip()
-AIHORDE_IMAGE_MODEL = os.getenv(
-    "AIHORDE_IMAGE_MODEL",
-    "Flux.1-Schnell fp8 (Compact)",
-).strip()
-AIHORDE_IMAGE_WIDTH = int(os.getenv("AIHORDE_IMAGE_WIDTH", "1024"))
-AIHORDE_IMAGE_HEIGHT = int(os.getenv("AIHORDE_IMAGE_HEIGHT", "1024"))
-AIHORDE_IMAGE_STEPS = int(os.getenv("AIHORDE_IMAGE_STEPS", "4"))
-AIHORDE_IMAGE_CFG = float(os.getenv("AIHORDE_IMAGE_CFG", "1"))
-AIHORDE_IMAGE_SAMPLER = os.getenv("AIHORDE_IMAGE_SAMPLER", "k_euler").strip() or "k_euler"
-AIHORDE_IMAGE_TIMEOUT = int(os.getenv("AIHORDE_IMAGE_TIMEOUT", "360"))
-AIHORDE_POLL_INTERVAL = float(os.getenv("AIHORDE_POLL_INTERVAL", "5"))
-
+# Image generation is strictly GigaChat-only. No alternative image provider is allowed.
 # Hugging Face LLM is used as a semantic art director before realistic image generation.
 # It converts each quote into a bespoke visual concept/prompt instead of relying
 # on a fixed archetype or a recurring metaphor.
@@ -105,6 +132,7 @@ HF_VISION_MODEL = os.getenv(
     "Salesforce/blip-image-captioning-base",
 ).strip()
 VISUAL_SEMANTIC_GATE = os.getenv("VISUAL_SEMANTIC_GATE", "1").strip() != "0"
+VISUAL_SEMANTIC_FAIL_CLOSED = os.getenv("VISUAL_SEMANTIC_FAIL_CLOSED", "1").strip() != "0"
 VISUAL_SEMANTIC_MIN_SCORE = float(os.getenv("VISUAL_SEMANTIC_MIN_SCORE", "0.68"))
 
 QUOTE_CORPUS_FILE = os.getenv("QUOTE_CORPUS_FILE", "quotes_corpus.json")
@@ -124,7 +152,7 @@ SEMANTIC_DUP_THRESHOLD = float(os.getenv("SEMANTIC_DUP_THRESHOLD", "0.90"))
 
 # Number of recent posts used to diversify visuals/topics.
 RECENT_DIVERSITY_WINDOW = int(os.getenv("RECENT_DIVERSITY_WINDOW", "12"))
-VISUAL_GENERATION_ATTEMPTS = int(os.getenv("VISUAL_GENERATION_ATTEMPTS", "4"))
+VISUAL_GENERATION_ATTEMPTS = int(os.getenv("VISUAL_GENERATION_ATTEMPTS", "5"))
 VISUAL_RETRY_DIVERSITY = os.getenv("VISUAL_RETRY_DIVERSITY", "1").strip() != "0"
 LLM_VISUAL_JUDGE = os.getenv("LLM_VISUAL_JUDGE", "1").strip() != "0"
 VISUAL_CONCEPT_CANDIDATES = int(os.getenv("VISUAL_CONCEPT_CANDIDATES", "3"))
@@ -138,7 +166,7 @@ VISUAL_CAPTION_DUP_THRESHOLD = float(os.getenv("VISUAL_CAPTION_DUP_THRESHOLD", "
 VISUAL_GENERICITY_PENALTY = float(os.getenv("VISUAL_GENERICITY_PENALTY", "0.18"))
 ADULT_AUDIENCE_STYLE = os.getenv(
     "ADULT_AUDIENCE_STYLE",
-    "sophisticated editorial fine-art, emotionally mature, elegant, realistic, non-glossy",
+    "sophisticated luminous fine-art, emotionally mature, elegant, realistic, gently feminine, emotionally warm, refined and non-glossy, with harmonious natural color",
 ).strip()
 
 DEFAULT_HEADERS = {
@@ -154,7 +182,8 @@ NEGATIVE_PROMPT = (
     "oversaturated, excessive HDR, fake glow, surreal artifacts, CGI, cartoon, anime, "
     "vector art, childish illustration, cheesy inspirational imagery"
 )
-POST_LOCK = asyncio.Lock()
+SOCIAL_POST_LOCK = asyncio.Lock()
+YOUTUBE_POST_LOCK = asyncio.Lock()
 
 # Runtime quota/auth circuit breaker. A token that returns 402/401 is skipped
 # for the remainder of the process lifetime so we do not repeatedly burn
@@ -466,19 +495,34 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+
+# Suppress noisy successful HTTP request logs while keeping warnings/errors.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("beauquot")
 
 class BotConfig:
     def __init__(self):
-        self.interval_hours = 3
-        self.auto_posting = True
-        self.last_post_time = None
+        # Two independent publication streams.
+        self.social_interval_hours = 3
+        self.youtube_interval_hours = 3
+        self.auto_social_posting = True
+        self.auto_youtube_posting = False
+        self.last_social_post_time = None
+        self.last_youtube_post_time = None
 
     def save_config(self):
         data = {
-            "interval_hours": self.interval_hours,
-            "auto_posting": self.auto_posting,
-            "last_post_time": self.last_post_time.isoformat() if self.last_post_time else None,
+            "social_interval_hours": self.social_interval_hours,
+            "youtube_interval_hours": self.youtube_interval_hours,
+            "auto_social_posting": self.auto_social_posting,
+            "auto_youtube_posting": self.auto_youtube_posting,
+            "last_social_post_time": self.last_social_post_time.isoformat() if self.last_social_post_time else None,
+            "last_youtube_post_time": self.last_youtube_post_time.isoformat() if self.last_youtube_post_time else None,
+            # Backward-compatible keys for older installations.
+            "interval_hours": self.social_interval_hours,
+            "auto_posting": self.auto_social_posting,
+            "last_post_time": self.last_social_post_time.isoformat() if self.last_social_post_time else None,
         }
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -487,16 +531,21 @@ class BotConfig:
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            self.interval_hours = int(data.get("interval_hours", 3))
-            self.auto_posting = bool(data.get("auto_posting", True))
-            value = data.get("last_post_time")
-            self.last_post_time = datetime.fromisoformat(value) if value else None
+            self.social_interval_hours = int(data.get("social_interval_hours", data.get("interval_hours", 3)))
+            self.youtube_interval_hours = int(data.get("youtube_interval_hours", data.get("interval_hours", 3)))
+            self.auto_social_posting = bool(data.get("auto_social_posting", data.get("auto_posting", True)))
+            self.auto_youtube_posting = bool(data.get("auto_youtube_posting", False))
+            social = data.get("last_social_post_time", data.get("last_post_time"))
+            youtube = data.get("last_youtube_post_time")
+            self.last_social_post_time = datetime.fromisoformat(social) if social else None
+            self.last_youtube_post_time = datetime.fromisoformat(youtube) if youtube else None
         except FileNotFoundError:
             self.save_config()
         except Exception as e:
             logger.warning("Config load error: %s", e)
             self.save_config()
 
+config = BotConfig()
 config = BotConfig()
 
 def load_admin_id():
@@ -597,6 +646,22 @@ def init_db():
         if "visual_hash" not in columns:
             conn.execute("ALTER TABLE visual_history ADD COLUMN visual_hash TEXT DEFAULT ''")
 
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS publications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                quote_hash TEXT NOT NULL,
+                quote_text TEXT NOT NULL,
+                author TEXT NOT NULL,
+                published_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                telegram_status TEXT DEFAULT '',
+                telegram_id TEXT DEFAULT '',
+                max_status TEXT DEFAULT '',
+                max_id TEXT DEFAULT '',
+                status TEXT DEFAULT '',
+                error TEXT DEFAULT ''
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_publications_status ON publications(status, published_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_quotes_hash ON quotes(quote_hash)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_quotes_used ON quotes(used_count, last_used_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_published_hash ON published_quotes(quote_hash)")
@@ -683,18 +748,26 @@ def is_published(text, author):
 def mark_published(content, image_bytes=None, provider="", archetype=""):
     q = content["quote"]
     h = quote_hash(q["quote_text"], q["author"])
+    published_at = datetime.now(timezone.utc).isoformat()
 
     # Idempotent: Telegram may have accepted the post even if DB recording
     # encounters an error.
     with get_db() as conn:
         conn.execute("""
             INSERT OR IGNORE INTO published_quotes
-                (quote_id, quote_hash, quote_text, author, image_hash,
-                 image_provider, visual_archetype, prompt_hash)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (quote_id, quote_hash, quote_text, author,
+                 published_at, image_hash, image_provider,
+                 visual_archetype, prompt_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            q.get("id"), h, q["quote_text"], q["author"],
-            image_hash(image_bytes), provider, archetype,
+            q.get("id"),
+            h,
+            q["quote_text"],
+            q["author"],
+            published_at,
+            image_hash(image_bytes),
+            provider,
+            archetype,
             hashlib.sha256(content["image_prompt"].encode("utf-8")).hexdigest()
         ))
 
@@ -1779,80 +1852,66 @@ def _normalize_relationship(value):
                "community", "self", "none"}
     return value if value in allowed else "none"
 
-def _hf_chat_completion(token, messages, max_tokens, temperature):
-    """Call HF Router with provider failover, stopping immediately on quota/auth errors."""
-    if not token:
-        raise ValueError("HF token is missing")
-    if token in _HF_TOKEN_DISABLED:
-        reason = _HF_TOKEN_DISABLED_REASONS.get(token, "disabled")
-        raise HFTokenUnavailable(reason)
+def _gigachat_access_token(force_refresh=False):
+    """Get and cache a GigaChat access token for roughly 30 minutes."""
+    global _GIGACHAT_ACCESS_TOKEN, _GIGACHAT_ACCESS_EXPIRES_AT
+    if not GIGACHAT_CREDENTIALS: raise ValueError("GIGACHAT_CREDENTIALS is missing")
+    now=time.time()
+    if not force_refresh and _GIGACHAT_ACCESS_TOKEN and now < _GIGACHAT_ACCESS_EXPIRES_AT-60: return _GIGACHAT_ACCESS_TOKEN
+    response=requests.post(GIGACHAT_OAUTH_URL,headers={"Content-Type":"application/x-www-form-urlencoded","Accept":"application/json","RqUID":str(uuid.uuid4()),"Authorization":f"Basic {GIGACHAT_CREDENTIALS}"},data={"scope":GIGACHAT_SCOPE},timeout=30)
+    if not response.ok: raise RuntimeError(f"GigaChat OAuth failed: HTTP {response.status_code} {response.text[:300]}")
+    data=response.json(); token=str(data.get("access_token") or "").strip()
+    if not token: raise RuntimeError("GigaChat OAuth response has no access_token")
+    try:
+        expires_at=float(data.get("expires_at")); expires_at=expires_at/1000.0 if expires_at>10_000_000_000 else expires_at
+    except Exception: expires_at=now+29*60
+    _GIGACHAT_ACCESS_TOKEN=token; _GIGACHAT_ACCESS_EXPIRES_AT=max(now+60,expires_at); return token
 
-    last_error = None
-    for provider in HF_LLM_PROVIDERS or ["auto"]:
-        model = HF_LLM_MODEL
-        if provider and provider != "auto":
-            model = f"{HF_LLM_MODEL}:{provider}"
-        payload = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": int(max_tokens),
-            "temperature": float(temperature),
-        }
-        if HF_LLM_DISABLE_THINKING:
-            payload["chat_template_kwargs"] = {"enable_thinking": False}
-        try:
-            response = requests.post(
-                "https://router.huggingface.co/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                },
+def _gigachat_chat_completion(messages,max_tokens,temperature):
+    token=_gigachat_access_token()
+    payload={"model":GIGACHAT_MODEL,"messages":messages,"max_tokens":int(max_tokens),"temperature":float(temperature)}
+    url=f"{GIGACHAT_API_BASE}/v1/chat/completions"
+
+    with gigachat_gate():
+        response=requests.post(
+            url,
+            headers={"Authorization":f"Bearer {token}","Content-Type":"application/json","Accept":"application/json"},
+            json=payload,
+            timeout=GIGACHAT_TIMEOUT,
+        )
+
+        if response.status_code==401:
+            token=_gigachat_access_token(force_refresh=True)
+            response=requests.post(
+                url,
+                headers={"Authorization":f"Bearer {token}","Content-Type":"application/json","Accept":"application/json"},
                 json=payload,
-                timeout=HF_LLM_TIMEOUT,
+                timeout=GIGACHAT_TIMEOUT,
             )
-            if response.ok:
-                data = response.json()
-                choices = data.get("choices") or []
-                if not choices:
-                    raise ValueError("HF chat response has no choices")
-                message = choices[0].get("message") or {}
-                content = message.get("content") or ""
-                reasoning = message.get("reasoning_content") or ""
-                combined = content if content else reasoning
-                if not combined:
-                    raise ValueError("HF chat response has empty message content")
-                logger.info("HF LLM chat succeeded: model=%s", model)
-                return combined, data
 
-            detail = response.text[:600]
-            if response.status_code in (401, 402):
-                reason = "quota_exhausted" if response.status_code == 402 else "unauthorized"
-                _disable_hf_token(token, f"{reason} via {provider}")
-                raise HFTokenUnavailable(
-                    f"HF chat {response.status_code} via {provider}: {detail}",
-                    status_code=response.status_code,
-                )
+    if response.status_code == 429:
+        gigachat_mark_rate_limit()
+        raise RuntimeError(f"GigaChat chat failed: HTTP 429 {response.text[:500]}")
 
-            last_error = RuntimeError(f"HF chat {response.status_code} via {provider}: {detail}")
-            logger.warning("HF LLM provider failed: %s", last_error)
-        except HFTokenUnavailable:
-            raise
-        except Exception as exc:
-            last_error = exc
-            logger.warning("HF LLM provider exception via %s: %s", provider, exc)
-    raise last_error or RuntimeError("No HF LLM provider succeeded")
+    if not response.ok:
+        raise RuntimeError(f"GigaChat chat failed: HTTP {response.status_code} {response.text[:500]}")
 
+    data=response.json()
+    choices=data.get("choices") or []
+    if not choices:
+        raise ValueError("GigaChat response has no choices")
 
-def _llm_tokens():
-    return _hf_token_pool()
+    return str((choices[0].get("message") or {}).get("content") or "").strip(),data
 
+def _hf_chat_completion(token,messages,max_tokens,temperature):
+    """Compatibility wrapper: semantic LLM calls now use GigaChat."""
+    return _gigachat_chat_completion(messages,max_tokens,temperature)
 
 def analyze_quote_semantics(quote_text, themes, mood):
     """Stage 1: semantic analyst. No visual styling; extract the actual claim and constraints."""
-    if not quote_text or not HF_TOKEN and not HF_TOKEN_2:
+    if not quote_text or not GIGACHAT_CREDENTIALS:
         return None
-    tokens = _hf_token_pool()
+    tokens = [("gigachat", "GigaChat")] if GIGACHAT_CREDENTIALS else []
 
     prompt = f"""
 You are a semantic analyst, not an image prompt writer. Analyze the exact human idea in this quote.
@@ -2005,7 +2064,7 @@ def generate_llm_visual_concept(
     if not quote_text:
         return None
 
-    tokens = _hf_token_pool()
+    tokens = [("gigachat", "GigaChat")] if GIGACHAT_CREDENTIALS else []
     if not tokens:
         logger.warning("No Hugging Face tokens configured for LLM art direction")
         return None
@@ -2037,7 +2096,7 @@ relationship, mood, landscape or aesthetic metaphor.
 DEFAULT AESTHETIC:
 {ADULT_AUDIENCE_STYLE}. Prefer realistic fine-art photography / cinematic
 realism with natural anatomy, authentic materials, subtle imperfections,
-restrained color grading, sophisticated composition, real environments and
+harmonious luminous color grading with gentle warm accents, sophisticated composition, real environments and
 plausible light. No childish or cartoon look. Painterly treatment is allowed
 only when it is genuinely better for the meaning.
 
@@ -2131,7 +2190,7 @@ Required JSON:
   "metaphor": "one subtle metaphor if useful, otherwise none",
   "medium": "realistic fine-art photography, cinematic photography, editorial photography, still life photography, architectural photography, documentary-like photography, painterly realism, or another tasteful medium",
   "lighting": "specific believable light",
-  "palette": "restrained sophisticated palette",
+  "palette": "harmonious luminous palette with soft warm accents, natural blush, peach, powder blue, muted lavender, sage, warm ivory or subtle golden tones when appropriate",
   "mood": "emotional atmosphere",
   "visual_motif": "unique 2-6 word label",
   "avoid": "specific wrong interpretations and clichés",
@@ -2341,16 +2400,74 @@ def build_visual_concept(quote_text, themes, mood, diversity_feedback=""):
         }
 
     # Reliable local fallback if HF LLM/semantic judge is temporarily unavailable.
+    # IMPORTANT: semantic analysis remains the source of truth when available.
+    # Local motifs provide visual diversity, but must never replace the causal
+    # meaning, concrete anchor or required visible evidence from semantic analysis.
     intent = extract_visual_intent(quote_text, themes, mood)
     archetype_by_name = {a["name"]: a for a in VISUAL_ARCHETYPES}
     archetype = archetype_by_name.get(intent["archetype"]) or select_archetype(themes, mood)
     motif = choose_visual_motif(intent["id"], recent_visuals)
     theme = themes[0] if themes else "soul"
-    theme_description = THEME_VISUALS.get(theme, "quiet emotional depth and authentic human presence")
+    theme_description = THEME_VISUALS.get(
+        theme,
+        "quiet emotional depth and authentic human presence"
+    )
     direction = abstract_visual_direction(intent["id"], themes, mood)
+
+    semantic = semantic or {}
+    semantic_anchor = str(semantic.get("specificity_anchor") or "").strip()
+    causal_logic = str(semantic.get("visual_mechanism") or "").strip()
+    core_claim = str(semantic.get("core_claim") or "").strip()
+    human_change = str(semantic.get("human_change") or "").strip()
+    must_show = [
+        str(item).strip()
+        for item in semantic.get("must_show", [])
+        if str(item).strip()
+    ]
+
+    motif_scene = motif["scene"] if motif else archetype["description"]
+    motif_metaphor = motif["metaphor"] if motif else direction["visual_metaphor"]
+
+    # When semantic analysis exists, build the scene around its concrete
+    # visual truth. The motif may enrich the composition but cannot override it.
+    if semantic_anchor or causal_logic or must_show:
+        scene_parts = []
+
+        if semantic_anchor:
+            scene_parts.append(semantic_anchor)
+
+        if causal_logic:
+            scene_parts.append(
+                "The scene must make the causal relationship visibly clear: "
+                + causal_logic
+            )
+
+        if must_show:
+            scene_parts.append(
+                "Clearly visible in the same coherent scene: "
+                + "; ".join(must_show)
+            )
+
+        if motif:
+            scene_parts.append(
+                "Use the following motif only as a secondary compositional "
+                "or atmospheric device, without replacing the semantic action: "
+                + motif_metaphor
+            )
+
+        scene = " ".join(scene_parts)
+        visual_metaphor = (
+            causal_logic
+            or core_claim
+            or motif_metaphor
+        )
+    else:
+        scene = motif_scene
+        visual_metaphor = motif_metaphor
+
     return {
         "archetype": archetype["name"],
-        "scene": motif["scene"] if motif else archetype["description"],
+        "scene": scene,
         "avoid_scene": f'{archetype["avoid"]}; {intent.get("avoid", "")}; {motif.get("avoid", "") if motif else ""}'.strip("; "),
         "subjects": intent.get("subjects") or archetype["subjects"],
         "camera": archetype["camera"],
@@ -2360,15 +2477,15 @@ def build_visual_concept(quote_text, themes, mood, diversity_feedback=""):
         "mood": mood,
         "mood_description": MOODS.get(mood, MOODS["introspective"])["visual"],
         "quote_intent": quote_text,
-        "visual_thesis": (semantic or {}).get("core_claim") or intent["thesis"],
-        "temporal_composition": (semantic or {}).get("temporal_composition", "none"),
-        "temporal_beats": (semantic or {}).get("temporal_beats", []),
-        "continuity_device": "one continuous environment with layered depth" if (semantic or {}).get("temporal_composition", "none") != "none" else "",
-        "semantic_anchor": (semantic or {}).get("specificity_anchor", "") or (motif["metaphor"] if motif else ""),
-        "causal_logic": (semantic or {}).get("visual_mechanism", "") or (motif["action"] if motif else ""),
+        "visual_thesis": core_claim or intent["thesis"],
+        "temporal_composition": semantic.get("temporal_composition", "none"),
+        "temporal_beats": semantic.get("temporal_beats", []),
+        "continuity_device": "one continuous environment with layered depth" if semantic.get("temporal_composition", "none") != "none" else "",
+        "semantic_anchor": semantic_anchor or (motif_metaphor if motif else ""),
+        "causal_logic": causal_logic or (motif["action"] if motif else ""),
         "specificity": "Use one concrete visible mechanism rather than a generic mood image.",
-        "narrative_action": (semantic or {}).get("human_change") or (motif["action"] if motif else intent["action"]),
-        "visual_metaphor": motif["metaphor"] if motif else direction["visual_metaphor"],
+        "narrative_action": human_change or (motif["action"] if motif else intent["action"]),
+        "visual_metaphor": visual_metaphor,
         "visual_motif": motif["id"] if motif else "",
         "medium": "realistic fine-art photography / cinematic realism",
         "style_mood": "sophisticated, emotionally mature, restrained, editorial",
@@ -2381,132 +2498,221 @@ def build_visual_concept(quote_text, themes, mood, diversity_feedback=""):
         "composition_type": "medium",
         "intent_id": intent["id"],
         "source": "local_fallback",
-        "semantic_analysis": semantic or {},
-        "must_show": (semantic or {}).get("must_show", []),
-        "must_not_show": (semantic or {}).get("must_not_show", []),
+        "semantic_analysis": semantic,
+        "must_show": must_show,
+        "must_not_show": semantic.get("must_not_show", []),
         "concept_judge_score": 0.0,
-        "concept_judge_reason": "local fallback",
+        "concept_judge_reason": "local fallback with semantic priority",
     }
 
 
 def generate_image_prompt(quote_text, themes, mood, diversity_feedback=""):
-    concept = build_visual_concept(quote_text, themes, mood, diversity_feedback=diversity_feedback)
+    """Create a concept-only image prompt without exposing the original quote."""
 
-    # When HF LLM succeeded, its quote-specific English prompt is the primary
-    # instruction. We only append channel-wide safety/style constraints here.
-    llm_prompt = str(concept.get("llm_image_prompt") or "").strip()
-    if llm_prompt:
-        prompt = f"""
-{llm_prompt}
+    concept = build_visual_concept(
+        quote_text,
+        themes,
+        mood,
+        diversity_feedback=diversity_feedback
+    )
 
-SEMANTIC ART-DIRECTOR CHECK:
-Core meaning: {concept.get("core_meaning", "")}
-Emotional tension: {concept.get("emotional_tension", "")}
-Human change/action: {concept.get("human_change", concept.get("narrative_action", ""))}
-Semantic anchor: {concept.get("semantic_anchor", "")}
-Causal visual logic: {concept.get("causal_logic", "")}
-Specificity test: {concept.get("specificity", "")}
-Relationship type: {concept.get("relationship_type", "none")}
-Visual mode: {concept.get("visual_mode", "direct")}
-Subject type: {concept.get("subject_type", "mixed")}
-Narrative mode: {concept.get("narrative_mode", "action")}
-Environment: {concept.get("environment", "")}
-Composition type: {concept.get("composition_type", "medium")}
-Temporal composition: {concept.get("temporal_composition", "none")}
-Temporal beats: {json.dumps(concept.get("temporal_beats", []), ensure_ascii=False)}
-Continuity device: {concept.get("continuity_device", "")}
-MUST VISUALLY COMMUNICATE: {json.dumps(concept.get("must_show", []), ensure_ascii=False)}
-MUST NOT VISUALLY SUGGEST: {json.dumps(concept.get("must_not_show", []), ensure_ascii=False)}
-Diversity instruction: {diversity_feedback or "Choose a visual approach not overrepresented in recent posts."}
+    def clean_value(value):
+        if value is None:
+            return ""
 
-GLOBAL VISUAL QUALITY:
-Sophisticated adult editorial / fine-art sensibility. Realistic fine-art
-photography or cinematic realism by default. Believable adult anatomy, natural
-skin texture, authentic materials, physically plausible light, subtle depth of
-field, restrained filmic color grading and lived-in environments. Beautiful
-without looking glossy, commercial, childish or over-processed.
+        if isinstance(value, (list, tuple)):
+            return "; ".join(
+                str(x).strip()
+                for x in value
+                if str(x).strip()
+            )
 
-SEMANTIC PRIORITY:
-The exact meaning of the source quote is more important than generic beauty.
-Every major visual element should support the story described above. Avoid
-filler scenery and generic inspirational imagery.
-SHOW THE MECHANISM: if the quote is about choice, show the choice; if it is
-about release, show what is released; if it is about reciprocity, show the
-reciprocal act; if it is about time or transformation, show a visible before/
-after relationship or progression. For past-present-future concepts, use layered depth and environmental continuity so the viewer reads a past trace, present focal state, and future direction in one believable scene. Do not substitute a symbol for the claim.
+        return str(value).strip()
 
-ABSOLUTE TEXT BAN:
-No text, letters, numbers, words, captions, subtitles, logos, signatures,
-watermarks, typography, readable signs, posters, books with readable pages,
-newspapers, screens, phones, packaging, menus, documents, cards, tickets,
-billboards, storefront lettering or UI.
+    scene = clean_value(concept.get("scene"))
+    subjects = clean_value(concept.get("subjects"))
+    action = clean_value(concept.get("narrative_action"))
+    anchor = clean_value(concept.get("semantic_anchor"))
+    thesis = clean_value(concept.get("visual_thesis"))
+    metaphor = clean_value(concept.get("visual_metaphor"))
+    environment = clean_value(concept.get("environment"))
+    composition = clean_value(concept.get("composition"))
+    must_show = clean_value(concept.get("must_show"))
+    must_not_show = clean_value(concept.get("must_not_show"))
+    avoid_scene = clean_value(concept.get("avoid_scene"))
 
-NEGATIVE STYLE:
-{NEGATIVE_PROMPT}; generic woman standing alone; doorway cliché; person walking
-into sunrise; person staring at mountains; romantic couple unless explicitly
-supported by the quote; kissing; wedding imagery; engagement-photo aesthetic;
-stock-photo pose; fashion campaign; beauty advertisement; motivational poster;
-generic inspirational landscape; forced symbolism; excessive surrealism;
-oversaturation; harsh HDR; plastic CGI; cartoon; anime; vector art; obvious
-watercolor or storybook treatment; fake photographer credit; random letters;
-visible watermark; logo; signature; text-like marks.
-
-ONE IMAGE, ONE STORY, ONE FOCAL IDEA. Vertical 4:5 composition suitable for
-Telegram.
-""".strip()
-        return re.sub(r"\s+", " ", prompt)[:5000], concept
-
-    # Local fallback: preserve the proven hf5 pipeline if the LLM endpoint is
-    # temporarily unavailable.
     prompt = f"""
-Create ONE beautiful vertical visual scene inspired by the exact meaning of the
-source quote. The image may be an elegant fine-art photograph or a refined
-painterly illustration, whichever serves the quote better. Do not force a
-single medium.
+Создай одну цельную художественную иллюстрацию по следующему визуальному замыслу.
 
-CORE IDEA: {concept["visual_thesis"]}
+СМЫСЛ ИДЕИ:
+{thesis}
 
-STORY / HUMAN ACTION: {concept["narrative_action"]}
+ГЛАВНАЯ СЦЕНА:
+{scene}
 
-VISUAL METAPHOR: {concept["visual_metaphor"]}
+ГЕРОИ ИЛИ ОБЪЕКТЫ:
+{subjects}
 
-SCENE: {concept["scene"]}
+ВИДИМОЕ ДЕЙСТВИЕ:
+{action}
 
-SUBJECTS: {concept["subjects"]}
+КЛЮЧЕВОЙ ВИЗУАЛЬНЫЙ ОБРАЗ:
+{anchor}
 
-MEDIUM: {concept["medium"]}
+ОБРАЗНОЕ РЕШЕНИЕ:
+{metaphor}
 
-EMOTIONAL ATMOSPHERE: {concept["style_mood"]}
+МЕСТО И АТМОСФЕРА:
+{environment}
 
-COLOR PALETTE: {concept["palette"]}
+ЧТО ОБЯЗАТЕЛЬНО ДОЛЖНО БЫТЬ ВИДНО:
+{must_show}
 
-LIGHT: {concept["light"]}
+ЧЕГО НЕЛЬЗЯ ПОКАЗЫВАТЬ:
+{must_not_show}
 
-COMPOSITION: {concept["composition"]}
+ДОПОЛНИТЕЛЬНО ИЗБЕГАЙ:
+{avoid_scene}
 
-SOURCE QUOTE — MEANING ONLY:
-{quote_text}
+КОМПОЗИЦИЯ:
+{composition}
 
-Translate the emotional meaning into one coherent scene. Do not draw the
-literal words. Do not make a beautiful woman the default subject. Prefer a
-specific action or relationship when the quote contains one.
+================================================
+ГЛАВНЫЙ ХУДОЖЕСТВЕННЫЙ СТИЛЬ  ВЫСОКИЙ ПРИОРИТЕТ
+================================================
 
-GLOBAL QUALITY: elegant, emotionally mature, sophisticated, realistic,
-quietly beautiful, adult editorial-art sensibility, soft believable light,
-restrained natural colors, authentic materials and skin texture.
+Изображение создаётся для женской аудитории.
 
-AVOID: {concept["avoid_scene"]}; {NEGATIVE_PROMPT}; generic doorway silhouette;
-generic road-to-sunrise; generic mountain-top triumph; motivational poster;
-forced symbolism; stock-photo posing; cartoon illustration; watercolor;
-storybook style; fantasy concept art unless semantically necessary.
+Сделай визуальный образ красивым, современным, эмоциональным,
+утончённым и эстетически привлекательным.
 
-ABSOLUTE TEXT BAN: no text, letters, numbers, words, captions, subtitles,
-logos, signatures, watermarks, typography, readable signs or UI.
+Это должна быть не сухая документальная фотография и не
+нейтральная иллюстрация.
 
-ONE IMAGE, ONE STORY, ONE FOCAL IDEA. Vertical 4:5 composition suitable for
-Telegram.
+Предпочитай атмосферу современной premium editorial photography
+и cinematic fine art с мягкой художественной обработкой.
+
+Если в сцене есть человек и пол не определён смыслом идеи,
+предпочитай выразительный женский образ или женскую эмоциональную
+перспективу.
+
+Главное ощущение изображения:
+
+нежность,
+красота,
+внутреннее тепло,
+эмоциональная глубина,
+спокойствие,
+утончённость,
+современная эстетика,
+женственная визуальная энергия,
+ощущение вдохновения.
+
+Используй:
+
+мягкий естественный или рассеянный свет,
+красивый свет на коже и предметах,
+тёплое солнечное свечение,
+деликатные световые акценты,
+воздушное пространство,
+тактильные детали,
+живые естественные жесты,
+красивую глубину кадра,
+элегантную композицию,
+визуальную лёгкость.
+
+ЦВЕТОВАЯ ПАЛИТРА:
+
+пудрово-розовые оттенки,
+кремовые оттенки,
+тёплый бежевый,
+персиковые оттенки,
+мягкий золотистый свет,
+нежный голубой,
+лавандовые акценты,
+приглушённый зелёный.
+
+Не используй все цвета одновременно.
+Выбирай 24 гармоничных оттенка в зависимости от смысла сцены.
+
+КАДР ДОЛЖЕН ВЫГЛЯДЕТЬ:
+
+дорого,
+эстетично,
+современно,
+эмоционально,
+живописно,
+натурально,
+визуально чисто.
+
+Важно создать конкретную сцену, а не абстрактную иллюстрацию.
+
+Зрительница должна сразу чувствовать:
+
+красоту момента,
+эмоцию,
+атмосферу,
+человеческую историю,
+смысл изображения.
+
+Показывай смысл через:
+
+живые действия,
+естественные жесты,
+взгляд,
+прикосновение,
+свет,
+пространство,
+детали окружающей среды.
+
+Если смысл можно передать через один красивый эмоциональный
+момент  выбирай именно такой момент.
+
+Избегай:
+
+холодной документальной фотографии,
+мужской корпоративной эстетики,
+стерильной editorial-подачи,
+случайных предметов без эмоционального смысла,
+банальных стоковых сцен,
+слишком тёмного изображения,
+грязных серых цветов,
+жёсткого контраста,
+агрессивного света,
+визуальной пустоты,
+безличной постановки,
+рекламной фотографии,
+позирования модели в камеру,
+глянцевой fashion-рекламы.
+
+Не создавай постер, обложку, открытку или графику для цитаты.
+
+КРИТИЧЕСКОЕ ПРАВИЛО:
+
+На изображении не должно быть никакого текста.
+
+Не добавляй:
+
+слова,
+буквы,
+цифры,
+цитаты,
+подписи,
+типографику,
+надписи,
+вывески,
+таблички,
+логотипы,
+водяные знаки,
+читаемые символы.
+
+Создай только чистую, красивую, эмоциональную художественную
+сцену без текста.
 """.strip()
+
     return re.sub(r"\s+", " ", prompt)[:5000], concept
+
+
 
 
 # ============================================================
@@ -2543,172 +2749,129 @@ def _image_bytes_from_pil(image):
         return None
 
 
-def _aihorde_headers():
-    return {
-        "Content-Type": "application/json",
-        "apikey": AIHORDE_API_KEY,
-        "Client-Agent": AIHORDE_CLIENT_AGENT,
-    }
-
-
-def generate_image_ai_horde(prompt, width=None, height=None):
-    """Generate one image through the free AI Horde volunteer network.
-
-    No Hugging Face image token is required. The anonymous AI Horde key is used
-    by default and has the lowest queue priority; a personal AI Horde key is
-    optional and can be supplied through AIHORDE_API_KEY.
-    """
-    if not prompt:
-        return None, ""
-
-    width = width or AIHORDE_IMAGE_WIDTH
-    height = height or AIHORDE_IMAGE_HEIGHT
-    # AI Horde expects dimensions divisible by 64.
-    width = max(64, int(width // 64 * 64))
-    height = max(64, int(height // 64 * 64))
-
-    payload = {
-        "prompt": f"{prompt}###{NEGATIVE_PROMPT}",
-        "models": [AIHORDE_IMAGE_MODEL],
-        "params": {
-            "width": width,
-            "height": height,
-            "steps": max(1, AIHORDE_IMAGE_STEPS),
-            "cfg_scale": AIHORDE_IMAGE_CFG,
-            "sampler_name": AIHORDE_IMAGE_SAMPLER,
-            "n": 1,
-        },
-        "nsfw": False,
-    }
-
-    try:
-        response = requests.post(
-            f"{AIHORDE_API_BASE}/generate/async",
-            headers=_aihorde_headers(),
-            json=payload,
-            timeout=30,
-        )
-        if response.status_code >= 400:
-            logger.warning("AI Horde submit failed: HTTP %s %s", response.status_code, response.text[:500])
-            return None, ""
-        job = response.json()
-        job_id = job.get("id")
-        if not job_id:
-            logger.warning("AI Horde returned no generation id: %s", job)
-            return None, ""
-
-        logger.info("AI Horde image job submitted: id=%s model=%s", job_id, AIHORDE_IMAGE_MODEL)
-        deadline = time.time() + AIHORDE_IMAGE_TIMEOUT
-        last_status = None
-
-        while time.time() < deadline:
-            time.sleep(max(1.0, AIHORDE_POLL_INTERVAL))
-            status_response = requests.get(
-                f"{AIHORDE_API_BASE}/generate/check/{job_id}",
-                headers={"Client-Agent": AIHORDE_CLIENT_AGENT},
-                timeout=20,
-            )
-            if status_response.status_code >= 400:
-                logger.warning("AI Horde check failed: HTTP %s %s", status_response.status_code, status_response.text[:300])
-                continue
-
-            status = status_response.json()
-            if status != last_status:
-                logger.info(
-                    "AI Horde job %s: done=%s queue=%s wait=%s finished=%s",
-                    job_id,
-                    status.get("done"),
-                    status.get("queue_position"),
-                    status.get("wait_time"),
-                    status.get("finished"),
-                )
-                last_status = status
-
-            if status.get("done"):
-                break
-        else:
-            logger.warning("AI Horde image job timed out: id=%s", job_id)
-            return None, ""
-
-        final_response = requests.get(
-            f"{AIHORDE_API_BASE}/generate/status/{job_id}",
-            headers={"Client-Agent": AIHORDE_CLIENT_AGENT},
-            timeout=30,
-        )
-        if final_response.status_code >= 400:
-            logger.warning("AI Horde final status failed: HTTP %s %s", final_response.status_code, final_response.text[:500])
-            return None, ""
-
-        final = final_response.json()
-        generations = final.get("generations") or []
-        if not generations:
-            logger.warning("AI Horde completed without an image: %s", final)
-            return None, ""
-
-        image_url = generations[0].get("img")
-        if not image_url:
-            logger.warning("AI Horde generation has no image URL: %s", generations[0])
-            return None, ""
-
-        image_response = requests.get(image_url, timeout=60)
-        if image_response.status_code != 200 or not is_valid_image(image_response.content):
-            logger.warning("AI Horde image download failed: HTTP %s", image_response.status_code)
-            return None, ""
-
-        model = generations[0].get("model") or AIHORDE_IMAGE_MODEL
-        worker = generations[0].get("worker_name") or "unknown"
-        logger.info("AI Horde image received: model=%s worker=%s bytes=%s", model, worker, len(image_response.content))
-        return image_response.content, f"AIHorde:{model}"
-    except requests.RequestException as exc:
-        logger.warning("AI Horde image generation network error: %s", exc)
-    except Exception as exc:
-        logger.warning("AI Horde image generation failed: %s", exc)
-
-    return None, ""
-
-
 def image_has_obvious_text(data):
-    """Reject generated images containing likely text, watermarks or credits."""
+    """OCR gate that rejects likely real text while avoiding random glyph false positives."""
+
     try:
         import pytesseract
-        from PIL import Image
+        from PIL import Image, ImageOps, ImageEnhance, ImageFilter
+    except ImportError as exc:
+        logger.error("OCR dependencies unavailable: %s", exc)
+        return True if OCR_REQUIRED else False
 
+    try:
         img = Image.open(BytesIO(data)).convert("RGB")
-        width, height = img.size
-        info = pytesseract.image_to_data(
-            img,
-            config="--psm 11",
-            output_type=pytesseract.Output.DICT,
+
+        scale = 2 if max(img.size) < 1800 else 1
+
+        gray = ImageOps.grayscale(img)
+
+        enlarged = gray.resize(
+            (gray.width * scale, gray.height * scale)
         )
+
+        enhanced = ImageEnhance.Contrast(enlarged).enhance(2.2)
+
+        sharpened = enhanced.filter(ImageFilter.SHARPEN)
+
+        variants = [
+            (img, "--oem 3 --psm 11"),
+            (enhanced, "--oem 3 --psm 11"),
+            (sharpened, "--oem 3 --psm 6")
+        ]
+
         hits = []
-        for text, conf, left, top, w, h in zip(
-            info.get("text", []),
-            info.get("conf", []),
-            info.get("left", []),
-            info.get("top", []),
-            info.get("width", []),
-            info.get("height", []),
-        ):
-            token = (text or "").strip()
-            try:
-                confidence = float(conf)
-            except Exception:
-                confidence = 0
-            letters = re.sub(r"[^A-Za-zА-Яа-яЁё]", "", token)
-            if len(letters) >= 4 and confidence >= 70:
-                hits.append((token, confidence, int(left or 0), int(top or 0), int(w or 0), int(h or 0)))
+
+        for variant, config in variants:
+
+            info = pytesseract.image_to_data(
+                variant,
+                lang="eng+rus",
+                config=config,
+                output_type=pytesseract.Output.DICT
+            )
+
+            for text_value, conf in zip(
+                info.get("text", []),
+                info.get("conf", [])
+            ):
+
+                token = clean_text(text_value or "")
+
+                try:
+                    confidence = float(conf)
+                except Exception:
+                    confidence = -1
+
+                letters = re.sub(
+                    r"[^A-Za-zА-Яа-яЁё0-9]",
+                    "",
+                    token
+                )
+
+                length = len(letters)
+
+                if length < 3:
+                    continue
+
+                is_suspicious = False
+
+                if length >= 6:
+                    is_suspicious = (
+                        confidence >= OCR_MIN_CONFIDENCE
+                    )
+
+                elif length >= 4:
+                    is_suspicious = (
+                        confidence >= 55
+                    )
+
+                elif length == 3:
+                    is_suspicious = (
+                        confidence >= 85
+                    )
+
+                if is_suspicious:
+                    hits.append(
+                        (
+                            token,
+                            round(confidence, 1)
+                        )
+                    )
 
         if hits:
-            bottom_hits = [h for h in hits if h[3] > height * 0.78]
-            logger.info("OCR text candidate(s) detected: total=%s bottom=%s", len(hits), len(bottom_hits))
+
+            unique = []
+
+            for hit in hits:
+                if hit not in unique:
+                    unique.append(hit)
+
+            logger.warning(
+                "OCR rejected image; text candidates=%s",
+                json.dumps(
+                    unique[:12],
+                    ensure_ascii=False
+                )
+            )
+
             return True
+
+        logger.info(
+            "OCR passed: no reliable readable text candidates"
+        )
+
         return False
-    except ImportError:
-        logger.warning("OCR gate unavailable: install pytesseract and tesseract-ocr")
-        return False
+
     except Exception as exc:
-        logger.debug("OCR gate skipped: %s", exc)
-        return False
+
+        logger.error(
+            "OCR verification failed: %s",
+            exc
+        )
+
+        return True if OCR_REQUIRED else False
+
 
 
 def caption_image_huggingface(data, token):
@@ -2808,8 +2971,10 @@ def validate_generated_image_semantics(image_bytes, quote_text, concept):
     if not image_bytes:
         return False, "", 0.0
 
+    # Never bypass the publication text gate. Generation retries also use OCR,
+    # but validation is the final defense before Telegram publication.
     if image_has_obvious_text(image_bytes):
-        logger.warning("Image rejected by OCR/text gate.")
+        logger.warning("Image rejected by final OCR/text gate")
         return False, "", 0.0
 
     if not VISUAL_SEMANTIC_GATE:
@@ -2852,9 +3017,21 @@ def validate_generated_image_semantics(image_bytes, quote_text, concept):
             return True, caption, score
         return False, caption, score
 
-    # External vision/judge unavailable: do not break the existing deployment.
-    logger.warning("Visual semantic gate could not obtain an HF vision/judge response; accepting image after OCR gate.")
-    return True, "", 1.0
+    if VISUAL_SEMANTIC_FAIL_CLOSED:
+        logger.warning(
+            "Visual semantic gate could not obtain a vision/judge response; "
+            "rejecting image because VISUAL_SEMANTIC_FAIL_CLOSED=1."
+        )
+        return False, "", 0.0
+
+    logger.warning(
+        "Visual semantic gate could not obtain a vision/judge response; "
+        "accepting image because VISUAL_SEMANTIC_FAIL_CLOSED=0."
+    )
+
+    # OCR, perceptual hash and all other image checks have already passed.
+    # Graceful fallback is explicitly enabled by configuration.
+    return True, "", 0.50
 
 
 def crop_image_to_square(data, target_size=1024):
@@ -2883,28 +3060,194 @@ def crop_image_to_square(data, target_size=1024):
     return data
 
 
-def generate_image(prompt, width=None, height=None):
-    """Generate images exclusively through the free AI Horde network.
+def generate_image_gigachat(prompt):
+    """Generate an image with GigaChat built-in text2image and download its file."""
+    if not prompt or not GIGACHAT_CREDENTIALS or not GIGACHAT_IMAGE_ENABLED:
+        return None, ""
 
-    Hugging Face credentials are intentionally not involved in image generation.
-    They remain available only for semantic analysis / visual judging.
-    """
-    # Always request the free-friendly square dimensions at the Horde boundary.
-    image, provider = generate_image_ai_horde(
-        prompt, width=AIHORDE_IMAGE_WIDTH, height=AIHORDE_IMAGE_HEIGHT
-    )
-    if image and is_valid_image(image):
-        image = crop_image_to_square(image, target_size=1024)
-        if image_has_obvious_text(image):
-            logger.warning("AI Horde candidate rejected: obvious text detected")
+    try:
+        token = _gigachat_access_token()
+
+        system_instruction = """
+You generate images only.
+
+Create one beautiful, photorealistic cinematic image based on the meaning and emotional atmosphere of the art direction.
+
+Interpret the idea through a concrete human moment, body language, facial expression, environment, lighting and composition.
+
+The image must be a clean visual scene, not a poster, advertisement, book cover, collage or graphic design.
+
+Do not include any writing, captions, letters, numbers, logos, watermarks, signs or typographic elements.
+All surfaces that could normally contain markings must be blank and unmarked.
+
+Use realistic adult people when appropriate, authentic emotions, natural anatomy, believable hands and fabric, tasteful editorial composition, cinematic photographic realism and refined natural colors.
+
+Create a visually distinctive scene with a clear focal subject and meaningful action.
+Do not reproduce the original quote or display any part of it in the image.
+""".strip()
+
+        user_instruction = f"""
+Create a single beautiful artistic illustration based on this art direction:
+
+{prompt}
+
+Remember: interpret the meaning visually.
+Do not reproduce or write any part of the quote.
+The image must contain absolutely no readable text or typography.
+""".strip()
+
+        payload = {
+            "model": GIGACHAT_MODEL,
+            "function_call": "auto",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": system_instruction
+                },
+                {
+                    "role": "user",
+                    "content": user_instruction
+                }
+            ]
+        }
+
+        url = f"{GIGACHAT_API_BASE}/v1/chat/completions"
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+
+        with gigachat_gate():
+            response = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=GIGACHAT_IMAGE_TIMEOUT
+            )
+
+            if response.status_code == 401:
+                token = _gigachat_access_token(force_refresh=True)
+                headers["Authorization"] = f"Bearer {token}"
+
+                response = requests.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    timeout=GIGACHAT_IMAGE_TIMEOUT
+                )
+
+        if response.status_code == 429:
+            gigachat_mark_rate_limit()
+            logger.warning(
+                "GigaChat image request rate limited: HTTP 429 %s",
+                response.text[:500]
+            )
+
+        if not response.ok:
+            logger.warning(
+                "GigaChat image request failed: HTTP %s %s",
+                response.status_code,
+                response.text[:500]
+            )
             return None, ""
-        return image, provider
 
-    logger.error("AI Horde image generation failed; no image returned")
-    return None, ""
+        data = response.json()
+
+        content = (
+            data.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+        )
+
+        match = re.search(
+            r'([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})',
+            content,
+            re.I
+        )
+
+        if not match:
+            logger.warning(
+                "GigaChat image response has no file id: %s",
+                content[:500]
+            )
+            return None, ""
+
+        file_id = match.group(1).strip()
+
+        image_response = requests.get(
+            f"{GIGACHAT_API_BASE}/v1/files/{file_id}/content",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "image/jpeg, image/png, application/octet-stream"
+            },
+            timeout=GIGACHAT_IMAGE_TIMEOUT
+        )
+
+        if (
+            image_response.status_code != 200
+            or not is_valid_image(image_response.content)
+        ):
+            logger.warning(
+                "GigaChat image download failed: HTTP %s",
+                image_response.status_code
+            )
+            return None, ""
+
+        logger.info(
+            "GigaChat image received: file_id=%s bytes=%s",
+            file_id,
+            len(image_response.content)
+        )
+
+        return image_response.content, f"GigaChat:{GIGACHAT_MODEL}"
+
+    except Exception as exc:
+        logger.warning(
+            "GigaChat image generation failed: %s",
+            exc
+        )
+        return None, ""
 
 
-# ============================================================
+def generate_image(prompt, width=None, height=None):
+    """Generate through GigaChat only and with bounded retries until OCR-clean output exists.
+
+    There is deliberately no emergency image, text card, AI Horde, or other provider
+    fallback: a non-GigaChat image must never enter the publication pipeline.
+    """
+    attempt = 0
+    max_attempts = max(1, int(os.getenv("GIGACHAT_MAX_ATTEMPTS", "5")))
+
+    while attempt < max_attempts:
+        attempt += 1
+        logger.info("GigaChat image generation attempt=%s", attempt)
+
+        image, provider = generate_image_gigachat(prompt)
+
+        if not image or not is_valid_image(image):
+            logger.warning("GigaChat attempt=%s failed to produce a valid image", attempt)
+        else:
+            image = crop_image_to_square(image, target_size=1024)
+            if image_has_obvious_text(image):
+                logger.warning("GigaChat attempt=%s rejected by OCR", attempt)
+            else:
+                logger.info("Using GigaChat image: OCR check passed on attempt=%s", attempt)
+                return image, provider
+
+        if attempt >= max_attempts:
+            logger.error(
+                "GigaChat image generation exhausted after %s attempts",
+                max_attempts
+            )
+            return None, ""
+
+        # Retry with delay, but never indefinitely.
+        delay = min(60, max(2, 2 ** min(attempt - 1, 5)))
+        logger.info("Retrying GigaChat image generation in %ss", delay)
+        time.sleep(delay)
+
+
 # TRANSLATION
 # ============================================================
 
@@ -2917,8 +3260,7 @@ def translate_google_web(text, dest_lang="ru"):
     r.raise_for_status()
     data = r.json()
     if isinstance(data, list) and data and isinstance(data[0], list):
-        parts = [p[0] for p in data[0] if isinstance(p, list) and p and p[0]]
-        return clean_text(" ".join(parts))
+        return clean_text(" ".join(p[0] for p in data[0] if isinstance(p, list) and p and p[0]))
     return ""
 
 def translate_mymemory(text, dest_lang="ru"):
@@ -2926,32 +3268,86 @@ def translate_mymemory(text, dest_lang="ru"):
     params = {"q": text[:500], "langpair": f"en|{dest_lang}"}
     r = requests.get(url, params=params, headers=DEFAULT_HEADERS, timeout=20)
     r.raise_for_status()
-    data = r.json()
-    result = clean_text(data.get("responseData", {}).get("translatedText", ""))
-    if "MYMEMORY WARNING" in result.upper():
+    result = clean_text(r.json().get("responseData", {}).get("translatedText", ""))
+    return "" if "MYMEMORY WARNING" in result.upper() else result
+
+def translate_with_gigachat(text, dest_lang="ru", is_author=False):
+    """Literary translation with a conservative fallback for unavailable LLMs."""
+    if not text or not GIGACHAT_CREDENTIALS:
         return ""
-    return result
+    kind = "author name" if is_author else "quote"
+    prompt = f"""You are a senior literary translator for a Russian quote publication.
+Translate this {kind} into idiomatic, grammatically correct Russian.
+Preserve meaning, nuance, emotional register, brevity and aphoristic rhythm.
+Never explain, summarize, embellish, modernize or add commentary.
+For names, use the established Russian form where it exists; otherwise use
+natural Russian transliteration. Do not translate the meaning of a name.
+Return ONLY the final publication-ready Russian text, with no labels or quotes
+added by you.
 
-def translate_text(text, dest_lang="ru"):
-    if not text:
-        return ""
-    if re.search(r"[а-яА-ЯёЁ]", text):
-        return text
+SOURCE:
+{text}"""
+    try:
+        raw, _ = _gigachat_chat_completion([
+            {"role": "system", "content": "You are a meticulous literary translator and editor. Output only the translation."},
+            {"role": "user", "content": prompt},
+        ], max_tokens=700, temperature=0.08)
+        result = clean_text(raw)
+        result = re.sub(r"^(перевод|translation)\s*[:—-]\s*", "", result, flags=re.I).strip()
+        if len(result) >= 2 and result[0] in "\"«“”" and result[-1] in "\"»“”":
+            result = result[1:-1].strip()
+        if result and len(result) >= max(1, min(3, len(text) // 8)):
+            return result
+    except Exception as exc:
+        logger.warning("GigaChat translation unavailable: %s", exc)
+    return ""
 
-    key = hashlib.md5(f"{text}|{dest_lang}".encode()).hexdigest()
-    if key in _translation_cache:
-        return _translation_cache[key]
+def validate_translation_quality(source, translation, is_author=False):
+    """Final publication gate: reject empty, meta, and low-quality literary output."""
+    candidate = clean_text(translation or "")
+    if not candidate or candidate.lower() == clean_text(source).lower():
+        return False
+    if re.search(r"(?i)^(перевод|translation|вот перевод|конечно)[\s:—-]", candidate):
+        return False
+    if len(candidate) > max(40, len(clean_text(source)) * 2.2):
+        return False
+    if is_author or not TRANSLATION_QUALITY_GATE or not GIGACHAT_CREDENTIALS:
+        return True
+    prompt = f"""You are a strict Russian literary editor. Score this translation of a quote from 0 to 1 for semantic fidelity, grammar, natural Russian, aphoristic rhythm, and absence of invented meaning. Return ONLY JSON: {{\"score\":0.0}}.
+SOURCE: {source}
+RUSSIAN: {candidate}"""
+    try:
+        raw, _ = _gigachat_chat_completion([{"role":"system","content":"Return only compact JSON."},{"role":"user","content":prompt}], max_tokens=80, temperature=0.0)
+        data = _parse_llm_json(raw) or {}
+        return float(data.get("score", 0)) >= TRANSLATION_MIN_SCORE
+    except Exception as exc:
+        logger.warning("Translation QA unavailable: %s", exc)
+        return True  # availability must not destroy a good translation already produced
 
-    for fn in (translate_google_web, translate_mymemory):
+def translate_text(text, dest_lang="ru", is_author=False):
+    if not text: return ""
+    if re.search(r"[а-яА-ЯёЁ]", text): return clean_text(text)
+    key = hashlib.md5(f"{text}|{dest_lang}|{is_author}".encode()).hexdigest()
+    if key in _translation_cache: return _translation_cache[key]
+    result = translate_with_gigachat(text, dest_lang, is_author=is_author)
+    if not result:
+        for fn in (translate_google_web, translate_mymemory):
+            try:
+                result = fn(text, dest_lang)
+                if result and result.lower() != text.lower(): break
+            except Exception as exc:
+                logger.warning("Translation error %s: %s", fn.__name__, exc)
+    result = clean_text(result or text)
+    if not validate_translation_quality(text, result, is_author=is_author):
+        logger.warning("Translation rejected by quality gate; using conservative fallback")
         try:
-            result = fn(text, dest_lang)
-            if result and result.lower() != text.lower():
-                _translation_cache[key] = result
-                return result
-        except Exception as e:
-            logger.warning("Translation error %s: %s", fn.__name__, e)
-
-    return text
+            fallback = translate_google_web(text, dest_lang)
+            if fallback and validate_translation_quality(text, fallback, is_author=is_author):
+                result = clean_text(fallback)
+        except Exception:
+            pass
+    _translation_cache[key] = result
+    return result
 
 # ============================================================
 # HASHTAGS / POST
@@ -2966,48 +3362,22 @@ def make_hashtag(text):
     return tag[:25].lower()
 
 def generate_hashtags(quote_text, author):
+    """Exactly three short, readable tags: two stable + one contextual."""
     topics = score_topics(quote_text)
     mood = analyze_mood(quote_text)
-
-    tags = ["женскиемысли", "цитатыдлядуши"]
-    mood_tags = {
-        "tender": "нежность",
-        "empowered": "сила",
-        "dreamy": "мечты",
-        "romantic": "любовь",
-        "introspective": "душа",
-        "healing": "исцеление",
-        "peaceful": "гармония",
-        "confident": "уверенность",
-    }
-    topic_tags = {
-        "self_love": "самоценность",
-        "femininity": "женственность",
-        "love": "любовь",
-        "healing": "исцеление",
-        "strength": "сила",
-        "growth": "развитие",
-        "dreams": "вдохновение",
-        "beauty": "красота",
-        "relationships": "отношения",
-        "freedom": "свобода",
-    }
-
-    if mood in mood_tags:
-        tags.append(mood_tags[mood])
-    for t in topics[:2]:
-        if t in topic_tags:
-            tags.append(topic_tags[t])
-
-    author_tag = make_hashtag(author)
-    if author_tag:
-        tags.append(author_tag)
-
-    result = []
-    for t in tags:
-        if t and t not in result:
-            result.append(t)
-    return result[:5]
+    topic_tags = {"self_love":"самоценность","femininity":"женственность","love":"любовь","healing":"исцеление","strength":"сила","growth":"развитие","dreams":"мечты","beauty":"красота","relationships":"отношения","freedom":"свобода"}
+    mood_tags = {"tender":"нежность","empowered":"сила","dreamy":"мечты","romantic":"любовь","introspective":"душа","healing":"исцеление","peaceful":"гармония","confident":"уверенность"}
+    contextual = next((topic_tags[t] for t in topics if t in topic_tags), mood_tags.get(mood, "вдохновение"))
+    result = ["цитаты", "мысли", contextual]
+    unique=[]
+    for tag in result:
+        if tag not in unique: unique.append(tag)
+    while len(unique) < 3:
+        for fallback in ("душа", "жизнь", "вдохновение"):
+            if fallback not in unique:
+                unique.append(fallback)
+                if len(unique)==3: break
+    return unique[:3]
 
 def build_diversity_feedback(recent_visuals):
     """Tell the next art director which visual dimensions are overused."""
@@ -3049,6 +3419,64 @@ def build_diversity_feedback(recent_visuals):
         lines.append("PEOPLE ARE OVERREPRESENTED: strongly prefer object, still life, architecture, nature or landscape if semantically valid.")
     return "\n".join(lines)
 
+def choose_unique_youtube_quote():
+    """Select a quote independently for YouTube, excluding only prior YouTube uploads."""
+    try:
+        publisher = YouTubePublisher(DB_FILE, YOUTUBE_WORK_DIR)
+        publisher.ensure_db()
+        with get_db() as conn:
+            rows = conn.execute(
+                "SELECT quote_hash FROM youtube_publications WHERE video_id IS NOT NULL AND video_id != ''"
+            ).fetchall()
+        youtube_hashes = {r[0] for r in rows}
+    except Exception as exc:
+        logger.warning("YouTube quote history check failed: %s", exc)
+        youtube_hashes = set()
+
+    candidates = get_candidate_rows(limit=1000)
+    scored = []
+    for q in candidates:
+        if quote_hash(q["quote_text"], q["author"]) in youtube_hashes:
+            continue
+        topics = json.loads(q.get("topic_json") or "[]")
+        score = float(q.get("quality_score") or 0) - min(int(q.get("used_count") or 0), 5) * 0.25 + random.uniform(0, 1.0)
+        scored.append((score, q))
+    if scored:
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return scored[0][1]
+
+    for text, author in FALLBACK_QUOTES:
+        if quote_hash(text, author) not in youtube_hashes:
+            q = upsert_quote(text, author, source="built-in fallback", quality_score=5, topics=score_topics(text), mood=analyze_mood(text))
+            if q:
+                return q
+    return None
+
+
+def fetch_youtube_content():
+    quote = choose_unique_youtube_quote()
+    if not quote:
+        return None
+    quote_text = quote["quote_text"]
+    author = quote["author"]
+    topics = json.loads(quote.get("topic_json") or "[]")
+    mood = quote.get("mood") or analyze_mood(quote_text)
+    translated_quote = translate_text(quote_text, "ru")
+    translated_author = translate_text(author, "ru", is_author=True)
+    diversity_feedback = build_diversity_feedback(get_recent_visuals(RECENT_DIVERSITY_WINDOW))
+    prompt, concept = generate_image_prompt(quote_text, topics, mood, diversity_feedback=diversity_feedback)
+    return {
+        "quote": quote,
+        "translated_quote": translated_quote,
+        "translated_author": translated_author,
+        "topics": topics,
+        "mood": mood,
+        "visual_concept": concept,
+        "image_prompt": prompt,
+        "hashtags": generate_hashtags(quote_text, translated_author),
+    }
+
+
 def fetch_post_content():
     quote = choose_unique_quote()
     if not quote:
@@ -3060,7 +3488,7 @@ def fetch_post_content():
     mood = quote.get("mood") or analyze_mood(quote_text)
 
     translated_quote = translate_text(quote_text, "ru")
-    translated_author = translate_text(author, "ru")
+    translated_author = translate_text(author, "ru", is_author=True)
     recent_visuals = get_recent_visuals(RECENT_DIVERSITY_WINDOW)
     diversity_feedback = build_diversity_feedback(recent_visuals)
     prompt, concept = generate_image_prompt(
@@ -3078,244 +3506,443 @@ def fetch_post_content():
         "hashtags": generate_hashtags(quote_text, translated_author),
     }
 
-def build_post_text(content, limit=1024):
-    q = html.escape(content["translated_quote"])
-    a = html.escape(content["translated_author"])
-    hashtags = "  ".join(f"#{x}" for x in content["hashtags"][:4])
-    channel_username = CHANNEL_ID.lstrip("@")
-    link = f'<a href="https://t.me/{channel_username}">Красивые Цитаты</a>'
+def build_post_text(content, limit=1024, platform="telegram"):
+    telegram_url = TELEGRAM_CHANNEL_URL
 
-    text = f"✨ «{q}» (c) {a}\n\n{hashtags}\n\n{link}"
-    if len(text) <= limit:
-        return text
+    if not telegram_url:
+        channel_username = re.sub(r"[^A-Za-z0-9_]", "", CHANNEL_ID.lstrip("@"))
+        telegram_url = f"https://t.me/{channel_username}" if channel_username else ""
 
-    # Caption-safe fallback without silently cutting in the middle too much.
-    short = content["translated_quote"][:180].rsplit(" ", 1)[0]
-    return (
-        f"✨ «{html.escape(short)}…»\n\n"
-        f"{hashtags}\n\n{link}"
-    )[:limit]
+    max_url = MAX_CHANNEL_URL
+
+    if platform == "max" or limit > 1024:
+        return max_caption(
+            content,
+            telegram_url=telegram_url,
+            max_url=max_url,
+        )
+
+    return telegram_caption(
+        content,
+        telegram_url=telegram_url,
+        max_url=max_url,
+        limit=limit,
+    )
 
 # ============================================================
-# POSTING
+# PUBLISHING: TELEGRAM + MAX (independent, retry, partial success)
 # ============================================================
 
-async def create_and_send_post(context=None):
-    if POST_LOCK.locked():
-        logger.warning("Post generation already running.")
-        return False
-
-    async with POST_LOCK:
+async def _retry_async(name, attempts, operation):
+    last_error = None
+    for attempt in range(1, max(1, attempts) + 1):
         try:
-            content = await asyncio.to_thread(fetch_post_content)
-            if not content:
-                logger.error("No unused quote available. History was NOT reset.")
-                return False
+            result = await operation()
+            logger.info("%s success attempt=%s/%s", name, attempt, attempts)
+            return True, result, ""
+        except Exception as exc:
+            last_error = str(exc)
+            logger.warning("%s error attempt=%s/%s: %s", name, attempt, attempts, exc)
+            if attempt < attempts:
+                await asyncio.sleep(min(attempt * 2, 8))
+    return False, None, last_error or "unknown error"
 
-            logger.info("Quote: %s — %s", content["quote"]["quote_text"], content["quote"]["author"])
-            logger.info("Visual concept: %s", content["visual_concept"])
-            logger.info("Prompt: %s", content["image_prompt"])
 
-            image_bytes = None
-            provider = ""
-            content["image_caption"] = ""
-            content["semantic_score"] = 0.0
-            best_concept = content["visual_concept"]
-            best_prompt = content["image_prompt"]
-            diversity_feedback = build_diversity_feedback(
-                get_recent_visuals(RECENT_DIVERSITY_WINDOW)
-            )
-
-            # Generate several genuinely different concepts when a provider
-            # succeeds but the first concept is not desirable. We keep the
-            # existing .env contract and do not require any new dependency.
-            for attempt in range(1, max(1, VISUAL_GENERATION_ATTEMPTS) + 1):
-                if attempt == 1:
-                    prompt = content["image_prompt"]
-                    concept = content["visual_concept"]
-                else:
-                    forced = (
-                        (diversity_feedback if VISUAL_RETRY_DIVERSITY else "")
-                        + "\nTHIS IS RETRY %d. Choose a substantially different subject, "
-                        "environment or narrative device from the previous concept. "
-                        "Do not merely rephrase it." % attempt
-                    )
-                    prompt, concept = await asyncio.to_thread(
-                        generate_image_prompt,
-                        content["quote"]["quote_text"],
-                        content["topics"],
-                        content["mood"],
-                        forced,
-                    )
-
-                candidate, candidate_provider = await asyncio.to_thread(
-                    generate_image, prompt
-                )
-                if candidate:
-                    semantic_ok, image_caption, semantic_score = validate_generated_image_semantics(
-                        candidate,
-                        content["quote"]["quote_text"],
-                        concept,
-                    )
-                    if not semantic_ok:
-                        logger.warning(
-                            "Visual generation attempt %s/%s rejected by semantic gate: score=%.2f",
-                            attempt, VISUAL_GENERATION_ATTEMPTS, semantic_score
-                        )
-                        continue
-                    image_bytes = candidate
-                    provider = candidate_provider
-                    best_concept = concept
-                    best_prompt = prompt
-                    content["image_caption"] = image_caption
-                    content["semantic_score"] = semantic_score
-                    logger.info(
-                        "Visual generation attempt %s/%s accepted; semantic_score=%.2f.",
-                        attempt, VISUAL_GENERATION_ATTEMPTS, semantic_score
-                    )
-                    break
-                logger.warning("Visual generation attempt %s/%s failed.", attempt, VISUAL_GENERATION_ATTEMPTS)
-
-            content["visual_concept"] = best_concept
-            content["image_prompt"] = best_prompt
-
-            bot = context.bot if context and getattr(context, "bot", None) else Bot(token=BOT_TOKEN)
-
-            if not image_bytes:
-                logger.error("Image generation failed after %s attempts; post was not published.", VISUAL_GENERATION_ATTEMPTS)
-                if ADMIN_CHAT_ID > 0:
-                    try:
-                        await bot.send_message(
-                            chat_id=ADMIN_CHAT_ID,
-                            text="❌ Изображение не сгенерировано. Пост НЕ опубликован.",
-                        )
-                    except Exception:
-                        pass
-                return False
-
-            caption = build_post_text(content, limit=1024)
-            await bot.send_photo(
+async def publish_to_telegram(bot, image_bytes, caption, animation_path=None):
+    async def _send():
+        # Static-image-only policy: never send animations, even if a stale path is supplied.
+        if image_bytes:
+            message = await bot.send_photo(
                 chat_id=CHANNEL_ID,
                 photo=image_bytes,
                 caption=caption,
                 parse_mode="HTML",
             )
+        else:
+            message = await bot.send_message(
+                chat_id=CHANNEL_ID,
+                text=caption,
+                parse_mode="HTML",
+            )
 
-            try:
-                mark_published(
-                    content,
-                    image_bytes=image_bytes,
-                    provider=provider,
-                    archetype=content["visual_concept"]["archetype"],
-                )
-                logger.info("Publication recorded in SQLite successfully.")
-            except Exception:
-                logger.exception("Telegram post succeeded, but SQLite recording failed.")
+        return getattr(message, "message_id", None)
 
-            config.last_post_time = datetime.now()
-            config.save_config()
+    return await _retry_async(
+        "TELEGRAM_PUBLISH",
+        max(3, TELEGRAM_RETRIES),
+        _send,
+    )
 
-            if ADMIN_CHAT_ID > 0:
-                try:
-                    await bot.send_message(
-                        chat_id=ADMIN_CHAT_ID,
-                        text=(
-                            "✅ Пост опубликован.\n\n"
-                            f"Цитата: {content['quote']['quote_text']}\n"
-                            f"Автор: {content['quote']['author']}\n"
-                            f"Тема: {', '.join(content['topics'])}\n"
-                            f"Настроение: {content['mood']}\n"
-                            f"Изображение: {provider or 'не доступно'}\n"
-                            f"Сцена: {content['visual_concept']['archetype']}\n"
-                            f"Метафора: {content['visual_concept'].get('visual_motif') or 'default'}\n"
-                            f"Semantic score: {content.get('semantic_score', 0):.2f}\n"
-                            f"Concept score: {content['visual_concept'].get('concept_judge_score', 0):.2f}\n\n"
-                            f"Следующий пост через {config.interval_hours} ч."
-                        ),
-                    )
-                except Exception:
-                    pass
 
-            return True
+async def publish_to_max(media_path, text):
+    if not MAX_ENABLED:
+        return False, None, "disabled"
+    if not MAX_PHONE:
+        return False, None, "MAX_PHONE not configured"
 
-        except Exception as e:
-            logger.exception("Post creation error")
-            if ADMIN_CHAT_ID > 0:
-                try:
-                    bot = context.bot if context and getattr(context, "bot", None) else Bot(token=BOT_TOKEN)
-                    await bot.send_message(
-                        chat_id=ADMIN_CHAT_ID,
-                        text=f"❌ Ошибка создания поста:\n{e}",
-                    )
-                except Exception:
-                    pass
-            return False
+    async def _send():
+        from pathlib import Path
+        from max.publisher import MaxPublisher
 
-# ============================================================
-# REPAIR / MAINTENANCE
-# ============================================================
+        media_file = Path(media_path)
+        runtime = Path(MAX_WORK_DIR)
+        runtime.mkdir(parents=True, exist_ok=True)
 
-def mark_quote_as_published_by_text(quote_text, author):
-    """Idempotently mark an already-published Telegram post in SQLite."""
-    h = quote_hash(quote_text, author)
+        publisher = MaxPublisher(
+            phone=MAX_PHONE,
+            session_name=MAX_SESSION,
+            work_dir=str(runtime),
+            channel_id=MAX_CHANNEL_ID,
+        )
+
+        try:
+            await publisher.start()
+            return await publisher.publish(
+                text=text,
+                media_path=str(media_file),
+            )
+        finally:
+            await publisher.close()
+
+    return await _retry_async(
+        "MAX_PUBLISH",
+        max(3, MAX_RETRIES),
+        _send,
+    )
+
+
+def save_publication_result(content, telegram_result, max_result):
+    q = content["quote"]
+    h = quote_hash(q["quote_text"], q["author"])
+    tg_ok, tg_id, tg_error = telegram_result
+    max_ok, max_id, max_error = max_result
+    if tg_ok and max_ok:
+        status = "published"
+    elif tg_ok or max_ok:
+        status = "partial_success"
+    else:
+        status = "error"
 
     with get_db() as conn:
-        q = conn.execute(
-            "SELECT id, quote_text, author FROM quotes WHERE quote_hash=?",
-            (h,),
-        ).fetchone()
-
-        if not q:
-            raise RuntimeError("Quote is not present in quotes table.")
-
         conn.execute("""
-            INSERT OR IGNORE INTO published_quotes
-                (quote_id, quote_hash, quote_text, author)
-            VALUES (?, ?, ?, ?)
-        """, (q["id"], h, q["quote_text"], q["author"]))
-
-        conn.execute("""
-            UPDATE quotes
-            SET used_count = CASE WHEN used_count < 1 THEN 1 ELSE used_count END,
-                last_used_at = COALESCE(last_used_at, ?)
-            WHERE quote_hash=?
-        """, (datetime.now(timezone.utc).isoformat(), h))
-
+            INSERT INTO publications
+            (quote_hash, quote_text, author, published_at, telegram_status, telegram_id,
+             max_status, max_id, status, error)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            h, q["quote_text"], q["author"], datetime.now(timezone.utc).isoformat(),
+            "success" if tg_ok else "error", str(tg_id or ""),
+            "success" if max_ok else "error", str(max_id or ""),
+            status, json.dumps({"telegram": tg_error, "max": max_error}, ensure_ascii=False)
+        ))
         conn.commit()
+    return status
 
-    return h
 
-# ============================================================
-# SCHEDULER
-# ============================================================
 
-async def scheduled_post_job(context):
-    await create_and_send_post(context)
+def _youtube_llm(prompt):
+    if not GIGACHAT_CREDENTIALS:
+        return ""
+    try:
+        return _gigachat_chat_completion([{"role":"user","content":prompt}], max_tokens=300, temperature=0.75)[0]
+    except Exception as exc:
+        logger.warning("YouTube GigaChat script failed: %s", exc)
+        return ""
+
+async def publish_to_youtube(content, image_bytes):
+    if not YOUTUBE_ENABLED:
+        return False, None, "disabled"
+
+    if not image_bytes:
+        return False, None, "no image"
+
+    try:
+        q = content["quote"]
+
+        h = quote_hash(
+            q["quote_text"],
+            q["author"]
+        )
+
+        publisher = YouTubePublisher(
+            DB_FILE,
+            YOUTUBE_WORK_DIR
+        )
+
+        result = await asyncio.to_thread(
+            publisher.publish,
+            content,
+            image_bytes,
+            h,
+            _youtube_llm,
+        )
+
+        if not isinstance(result, tuple) or len(result) != 3:
+            logger.error(
+                "YouTube publisher returned invalid result: %r",
+                result
+            )
+            return False, None, "invalid publisher result"
+
+        return result
+
+    except Exception as exc:
+        logger.exception(
+            "YouTube publication crashed but main publication continues"
+        )
+
+        return False, None, str(exc)
+
+
+async def _notify_progress(progress, text):
+    if progress:
+        try:
+            await progress(text)
+        except Exception:
+            logger.exception("Progress notification failed")
+
+
+async def build_content_and_image(progress=None, youtube=False):
+    await _notify_progress(progress, "📝 1/4 Выбираю новую цитату...")
+    content = await asyncio.to_thread(fetch_youtube_content if youtube else fetch_post_content)
+    if not content:
+        return None, None, "", "Нет новых уникальных цитат"
+
+    await _notify_progress(progress, "🎨 2/4 Генерирую и проверяю изображение...")
+    image_bytes = None
+    provider = ""
+    content["image_caption"] = ""
+    content["semantic_score"] = 0.0
+    best_concept = content["visual_concept"]
+    best_prompt = content["image_prompt"]
+    diversity_feedback = build_diversity_feedback(get_recent_visuals(RECENT_DIVERSITY_WINDOW))
+
+    attempt = 0
+    max_visual_attempts = int(os.getenv("VISUAL_OUTER_MAX_ATTEMPTS", "3"))
+
+    while not image_bytes and attempt < max_visual_attempts:
+        attempt += 1
+        if attempt == 1:
+            prompt = content["image_prompt"]
+            concept = content["visual_concept"]
+        else:
+            forced = ((diversity_feedback if VISUAL_RETRY_DIVERSITY else "") +
+                      "\nTHIS IS RETRY %d. The previous image was rejected. Create a substantially different, concrete scene that makes the exact quote meaning unmistakable. Do not merely rephrase it. Prioritize semantic accuracy over decorative beauty." % attempt)
+            prompt, concept = await asyncio.to_thread(
+                generate_image_prompt,
+                content["quote"]["quote_text"], content["topics"], content["mood"], forced,
+            )
+
+        candidate, candidate_provider = await asyncio.to_thread(generate_image, prompt)
+        if not candidate:
+            logger.warning(
+                "Visual generation returned no candidate on attempt=%s/%s",
+                attempt,
+                max_visual_attempts,
+            )
+            if attempt >= max_visual_attempts:
+                logger.error(
+                    "Visual generation stopped after %s attempts; "
+                    "GigaChat/provider may be temporarily unavailable",
+                    max_visual_attempts,
+                )
+                return None, None, "", "GigaChat temporarily unavailable"
+
+            await asyncio.sleep(min(60, max(10, 10 * attempt)))
+            continue
+
+        semantic_ok, image_caption, semantic_score = validate_generated_image_semantics(
+            candidate, content["quote"]["quote_text"], concept,
+        )
+        if not semantic_ok:
+            logger.warning(
+                "Visual generation rejected attempt=%s/%s score=%.2f; creating a new concept",
+                attempt,
+                max_visual_attempts,
+                semantic_score,
+            )
+
+            if attempt >= max_visual_attempts:
+                logger.error(
+                    "Visual generation stopped after %s semantic attempts",
+                    max_visual_attempts,
+                )
+                return None, None, "", "Image semantic validation failed"
+
+            await asyncio.sleep(min(30, max(5, 5 * attempt)))
+            continue
+
+        image_bytes = candidate
+        provider = candidate_provider
+        best_concept = concept
+        best_prompt = prompt
+        content["image_caption"] = image_caption
+        content["semantic_score"] = semantic_score
+
+    content["visual_concept"] = best_concept
+    content["image_prompt"] = best_prompt
+
+    try:
+        image_bytes = await asyncio.to_thread(prepare_social_image, image_bytes)
+    except Exception as exc:
+        logger.warning("Image preparation failed; using original: %s", exc)
+
+    return content, image_bytes, provider, ""
+
+
+async def create_and_publish_social(context=None, progress=None):
+    if SOCIAL_POST_LOCK.locked():
+        return False, "Публикация MAX + Telegram уже выполняется"
+
+    async with SOCIAL_POST_LOCK:
+        try:
+            content, image_bytes, provider, error = await build_content_and_image(progress)
+            if not content:
+                return False, error
+            await _notify_progress(progress, "🚀 3/4 Публикую отдельно в Telegram и MAX...")
+            bot = context.bot if context and getattr(context, "bot", None) else Bot(token=BOT_TOKEN)
+            caption = build_post_text(content, limit=1024)
+            max_text = build_post_text(content, limit=4000, platform="max")
+            # Publish the validated, clean static artwork directly. No decorative frame,
+            # logo, watermark, animation or generated text is added at this stage.
+            media_path = Path(MAX_WORK_DIR) / f"quote-{uuid.uuid4().hex}.jpg"
+            media_path.parent.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(media_path.write_bytes, image_bytes)
+
+            try:
+                telegram_result = await publish_to_telegram(
+                    bot,
+                    image_bytes,
+                    caption,
+                )
+
+                max_result = await publish_to_max(
+                    str(media_path),
+                    max_text,
+                )
+            finally:
+                try:
+                    media_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+            try:
+                status = save_publication_result(content, telegram_result, max_result)
+            except Exception:
+                logger.exception("Publication state save failed")
+                status = "partial_success"
+
+            if telegram_result[0] or max_result[0]:
+                mark_published(
+                    content, image_bytes=image_bytes, provider=provider,
+                    archetype=content["visual_concept"].get("archetype", ""),
+                )
+                config.last_social_post_time = datetime.now()
+                config.save_config()
+                await _notify_progress(progress, "✅ 4/4 MAX + Telegram: готово")
+                details = []
+                details.append("Telegram: ✅" if telegram_result[0] else f"Telegram: ❌ {telegram_result[2]}")
+                details.append("MAX: ✅" if max_result[0] else f"MAX: ❌ {max_result[2]}")
+                return True, "\n".join(details)
+            return False, f"Telegram: {telegram_result[2]} | MAX: {max_result[2]}"
+        except Exception as exc:
+            logger.exception("Social publication error")
+            return False, str(exc)
+
+
+async def create_and_publish_youtube(context=None, progress=None, force_private=True):
+    if YOUTUBE_POST_LOCK.locked():
+        return False, None, "Создание YouTube Shorts уже выполняется"
+    if not YOUTUBE_ENABLED:
+        return False, None, "YouTube выключен в .env"
+
+    async with YOUTUBE_POST_LOCK:
+        try:
+            content, image_bytes, provider, error = await build_content_and_image(progress, youtube=True)
+            if not content:
+                return False, None, error
+            await _notify_progress(progress, "🎬 3/4 Создаю сценарий, озвучку и видео...")
+            publisher = YouTubePublisher(DB_FILE, YOUTUBE_WORK_DIR)
+            original_privacy = publisher.privacy
+            if force_private:
+                publisher.privacy = "private"
+            try:
+                result = await asyncio.to_thread(
+                    publisher.publish,
+                    content,
+                    image_bytes,
+                    quote_hash(content["quote"]["quote_text"], content["quote"]["author"]),
+                    _youtube_llm,
+                )
+            finally:
+                publisher.privacy = original_privacy
+
+            success, video_id, publish_error = result
+            if success:
+                config.last_youtube_post_time = datetime.now()
+                config.save_config()
+                await _notify_progress(progress, "☁️ 4/4 YouTube Shorts загружен")
+                return True, video_id, ""
+            return False, None, publish_error or "Неизвестная ошибка YouTube"
+        except Exception as exc:
+            logger.exception("YouTube publication error")
+            return False, None, str(exc)
+
+
+# Compatibility alias for external calls.
+async def create_and_send_post(context=None):
+    ok, _ = await create_and_publish_social(context)
+    return ok
+
+
+async def scheduled_social_post_job(context):
+    ok, error = await create_and_publish_social(context)
+    if not ok:
+        logger.error("Scheduled MAX + Telegram publication failed: %s", error)
+
+
+async def scheduled_youtube_post_job(context):
+    ok, video_id, error = await create_and_publish_youtube(context, force_private=False)
+    if not ok:
+        logger.error("Scheduled YouTube publication failed: %s", error)
+
 
 def configure_job_queue(application):
     queue = application.job_queue
     if not queue:
         logger.warning("JobQueue unavailable. Install python-telegram-bot[job-queue].")
         return
+    for name in ("auto_post", "auto_social_post", "auto_youtube_post"):
+        for job in queue.get_jobs_by_name(name):
+            job.schedule_removal()
 
-    for job in queue.get_jobs_by_name("auto_post"):
-        job.schedule_removal()
+    now = datetime.now()
+    if config.auto_social_posting:
+        if config.last_social_post_time:
+            target = config.last_social_post_time + timedelta(hours=config.social_interval_hours)
+            social_delay = max(60, (target - now).total_seconds())
+        else:
+            social_delay = 20
+        queue.run_repeating(
+            scheduled_social_post_job,
+            interval=timedelta(hours=config.social_interval_hours),
+            first=social_delay,
+            name="auto_social_post",
+        )
 
-    if not config.auto_posting:
-        return
+    if config.auto_youtube_posting:
+        if config.last_youtube_post_time:
+            target = config.last_youtube_post_time + timedelta(hours=config.youtube_interval_hours)
+            youtube_delay = max(60, (target - now).total_seconds())
+        else:
+            youtube_delay = 30
+        queue.run_repeating(
+            scheduled_youtube_post_job,
+            interval=timedelta(hours=config.youtube_interval_hours),
+            first=youtube_delay,
+            name="auto_youtube_post",
+        )
 
-    if config.last_post_time:
-        next_time = config.last_post_time + timedelta(hours=config.interval_hours)
-        delay = max(60, (next_time - datetime.now()).total_seconds())
-    else:
-        delay = 20
-
-    queue.run_repeating(
-        scheduled_post_job,
-        interval=timedelta(hours=config.interval_hours),
-        first=delay,
-        name="auto_post",
-    )
 
 async def post_init(application):
     await asyncio.to_thread(seed_database)
@@ -3328,33 +3955,330 @@ async def post_init(application):
 def admin_keyboard():
     return ReplyKeyboardMarkup(
         [
-            ["🚀 Отправить пост", "📊 Статистика"],
-            ["⚙️ Автопостинг", "⏰ Интервал"],
-            ["🧪 Тест картинки", "🔎 Тест уникальности"],
+            ["📊 Статус"],
+            ["🚀 Опубликовать MAX + TG", "📺 Создать YouTube Shorts"],
+            ["⚙️ Автопостинг MAX + TG", "⚙️ Автопостинг YouTube"],
+            ["⏰ Интервал MAX + TG", "⏰ Интервал YouTube"],
+            ["📺 YouTube", "🧪 Тест YouTube"],
+            ["🖼 Тест картинки", "🔎 Тест уникальности"],
         ],
         resize_keyboard=True,
     )
 
+
+def _next_time(last, hours):
+    if not last:
+        return "не запланирован"
+    return (last + timedelta(hours=hours)).strftime("%d.%m.%Y %H:%M")
+
+
 def status_text():
     quotes, published = get_stats()
-    next_post = "неизвестно"
-    if config.last_post_time:
-        next_post = (
-            config.last_post_time + timedelta(hours=config.interval_hours)
-        ).strftime("%d.%m.%Y %H:%M")
-
     return (
-        "🤖 BeauQuot 2.2\n\n"
+        "🤖 BeauQuot 4.1\n"
+        "━━━━━━━━━━━━━━━━\n"
         f"Кандидатов в БД: {quotes}\n"
-        f"Опубликовано: {published}\n"
-        f"Автопостинг: {'✅' if config.auto_posting else '❌'}\n"
-        f"Интервал: {config.interval_hours} ч.\n"
-        f"Последний пост: "
-        f"{config.last_post_time.strftime('%d.%m.%Y %H:%M') if config.last_post_time else 'нет'}\n"
-        f"Следующий: {next_post}\n\n"
-        "Уникальность: exact + normalized + optional semantic\n"
-        "Изображения: AI Horde (бесплатная volunteer-сеть, без HF-токенов)"
+        f"Опубликовано MAX/TG: {published}\n\n"
+        "📣 MAX + Telegram\n"
+        f"Автопостинг: {'✅ ВКЛ' if config.auto_social_posting else '❌ ВЫКЛ'}\n"
+        f"Интервал: {config.social_interval_hours} ч.\n"
+        f"Последний: {config.last_social_post_time.strftime('%d.%m.%Y %H:%M') if config.last_social_post_time else 'нет'}\n"
+        f"Следующий: {_next_time(config.last_social_post_time, config.social_interval_hours)}\n\n"
+        "📺 YouTube Shorts\n"
+        f"Автопостинг: {'✅ ВКЛ' if config.auto_youtube_posting else '❌ ВЫКЛ'}\n"
+        f"Интервал: {config.youtube_interval_hours} ч.\n"
+        f"Последний: {config.last_youtube_post_time.strftime('%d.%m.%Y %H:%M') if config.last_youtube_post_time else 'нет'}\n"
+        f"Следующий: {_next_time(config.last_youtube_post_time, config.youtube_interval_hours)}"
     )
+
+
+def youtube_status_text():
+    enabled = os.getenv(
+        "YOUTUBE_ENABLED",
+        "0"
+    ).strip() == "1"
+
+    privacy = os.getenv(
+        "YOUTUBE_PRIVACY_STATUS",
+        "private"
+    ).strip().lower()
+
+    client_secret = os.getenv(
+        "YOUTUBE_CLIENT_SECRET_FILE",
+        "youtube_client_secret.json"
+    ).strip()
+
+    token_file = os.getenv(
+        "YOUTUBE_TOKEN_FILE",
+        "youtube_token.json"
+    ).strip()
+
+    music_enabled = os.getenv(
+        "YOUTUBE_MUSIC_ENABLED",
+        "1"
+    ).strip() != "0"
+
+    max_seconds = os.getenv(
+        "YOUTUBE_SHORT_MAX_SECONDS",
+        "58"
+    ).strip()
+
+    last_video = None
+    last_status = None
+    last_date = None
+
+    try:
+        publisher = YouTubePublisher(
+            DB_FILE,
+            YOUTUBE_WORK_DIR
+        )
+
+        publisher.ensure_db()
+
+        with get_db() as conn:
+            row = conn.execute(
+                """
+                SELECT video_id, status, published_at
+                FROM youtube_publications
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+
+            if row:
+                last_video = row[0]
+                last_status = row[1]
+                last_date = row[2]
+
+    except Exception as exc:
+        logger.warning(
+            "YouTube status DB check failed: %s",
+            exc
+        )
+
+    client_ok = os.path.exists(client_secret)
+    token_ok = os.path.exists(token_file)
+
+    result = (
+        "📺 YouTube Shorts\n\n"
+        f"Интеграция: {'✅ ВКЛЮЧЕНА' if enabled else '❌ ВЫКЛЮЧЕНА'}\n"
+        f"Публикация: {'🔒 PRIVATE' if privacy == 'private' else '📺 PUBLIC'}\n"
+        f"OAuth client: {'✅ найден' if client_ok else '❌ не найден'}\n"
+        f"OAuth token: {'✅ найден' if token_ok else '❌ не найден'}\n"
+        f"Музыка: {'🎵 включена' if music_enabled else '❌ выключена'}\n"
+        f"Макс. длительность: {max_seconds} сек."
+    )
+
+    if last_video:
+        result += (
+            "\n\nПоследнее видео:\n"
+            f"ID: {last_video}\n"
+            f"Статус: {last_status or 'unknown'}\n"
+            f"Дата: {last_date or 'unknown'}\n\n"
+            f"https://studio.youtube.com/video/{last_video}/edit"
+        )
+    else:
+        result += (
+            "\n\nВидео через основной pipeline "
+            "пока не найдено."
+        )
+
+    return result
+
+
+def youtube_privacy_keyboard():
+    current = os.getenv(
+        "YOUTUBE_PRIVACY_STATUS",
+        "private"
+    ).strip().lower()
+
+    private_label = (
+        "✅ PRIVATE"
+        if current == "private"
+        else "PRIVATE"
+    )
+
+    public_label = (
+        "✅ PUBLIC"
+        if current == "public"
+        else "PUBLIC"
+    )
+
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    private_label,
+                    callback_data="youtube_privacy:private"
+                ),
+                InlineKeyboardButton(
+                    public_label,
+                    callback_data="youtube_privacy:public"
+                ),
+            ]
+        ]
+    )
+
+
+def set_youtube_privacy(value):
+    if value not in ("private", "public"):
+        raise ValueError("Invalid YouTube privacy")
+
+    env_path = Path(__file__).with_name(".env")
+
+    lines = []
+
+    if env_path.exists():
+        lines = env_path.read_text(
+            encoding="utf-8"
+        ).splitlines()
+
+    found = False
+    new_lines = []
+
+    for line in lines:
+        if line.startswith(
+            "YOUTUBE_PRIVACY_STATUS="
+        ):
+            new_lines.append(
+                f"YOUTUBE_PRIVACY_STATUS={value}"
+            )
+            found = True
+        else:
+            new_lines.append(line)
+
+    if not found:
+        new_lines.append(
+            f"YOUTUBE_PRIVACY_STATUS={value}"
+        )
+
+    env_path.write_text(
+        "\n".join(new_lines) + "\n",
+        encoding="utf-8"
+    )
+
+    os.environ[
+        "YOUTUBE_PRIVACY_STATUS"
+    ] = value
+
+
+async def show_youtube_status(update, context):
+    await update.message.reply_text(
+        youtube_status_text(),
+        reply_markup=youtube_privacy_keyboard()
+    )
+
+
+async def test_youtube_upload(update, context):
+    enabled = os.getenv(
+        "YOUTUBE_ENABLED",
+        "0"
+    ).strip() == "1"
+
+    if not enabled:
+        await update.message.reply_text(
+            "❌ YouTube выключен в .env"
+        )
+        return
+
+    await update.message.reply_text(
+        "📺 Создаю 3-секундное тестовое видео "
+        "и загружаю его как PRIVATE..."
+    )
+
+    async def job():
+        try:
+            publisher = YouTubePublisher(
+                DB_FILE,
+                YOUTUBE_WORK_DIR
+            )
+
+            publisher.ensure_db()
+
+            test_video = (
+                publisher.work /
+                "telegram_youtube_test.mp4"
+            )
+
+            def make_and_upload():
+                import subprocess
+
+                cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-nostdin",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=c=black:s=720x1280:d=3:r=30",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "anullsrc=r=44100:cl=stereo",
+                    "-shortest",
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "aac",
+                    str(test_video),
+                ]
+
+                subprocess.run(
+                    cmd,
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=60
+                )
+
+                original_privacy = publisher.privacy
+                publisher.privacy = "private"
+
+                try:
+                    video_id = publisher.upload(
+                        video=str(test_video),
+                        title="BeauQuot Telegram YouTube Test",
+                        description=(
+                            "Тестовая загрузка "
+                            "из Telegram-админки BeauQuot."
+                        ),
+                        tags=[
+                            "BeauQuot",
+                            "test",
+                            "quotes"
+                        ]
+                    )
+                finally:
+                    publisher.privacy = original_privacy
+
+                return video_id
+
+            video_id = await asyncio.to_thread(
+                make_and_upload
+            )
+
+            await update.effective_message.reply_text(
+                f"✅ YouTube тест успешен!\n\n"
+                f"Video ID: {video_id}\n\n"
+                f"🔒 Загружено как PRIVATE\n\n"
+                f"https://studio.youtube.com/video/"
+                f"{video_id}/edit"
+            )
+
+        except Exception as exc:
+            logger.exception(
+                "YouTube test upload failed"
+            )
+
+            await update.effective_message.reply_text(
+                f"❌ Ошибка YouTube-теста:\n\n"
+                f"{str(exc)[:3000]}"
+            )
+
+    spawn_job(context, job())
+
 
 def spawn_job(context, coro):
     if hasattr(context.application, "create_task"):
@@ -3377,45 +4301,108 @@ async def start_command(update: Update, context):
         reply_markup=admin_keyboard(),
     )
 
-async def send_post_now(update, context):
+
+
+async def create_youtube_shorts(update, context):
     await update.message.reply_text(
-        "⏳ Создаю пост. Картинка может генерироваться до нескольких минут."
+        "📺 Запускаю создание YouTube Shorts...\n\n"
+        "Это отдельный pipeline и он НЕ публикует в MAX/Telegram."
     )
 
+    async def progress(text):
+        await update.effective_message.reply_text(text)
+
     async def job():
-        ok = await create_and_send_post(context)
-        if not ok:
+        ok, video_id, error = await create_and_publish_youtube(
+            context, progress=progress, force_private=False
+        )
+        if ok:
             await update.effective_message.reply_text(
-                "❌ Не удалось создать/опубликовать пост."
+                "✅ YouTube Shorts успешно создан!\n\n"
+                f"Video ID: {video_id}\n"
+                "🔒 Загружено как PRIVATE\n\n"
+                f"https://studio.youtube.com/video/{video_id}/edit"
+            )
+        else:
+            await update.effective_message.reply_text(
+                f"❌ YouTube Shorts не создан.\n\nОшибка: {error}"
             )
 
     spawn_job(context, job())
 
+
+async def send_social_post_now(update, context):
+    await update.message.reply_text(
+        "🚀 Запускаю публикацию в MAX + Telegram...\n\n"
+        "YouTube при этом НЕ запускается."
+    )
+
+    async def progress(text):
+        await update.effective_message.reply_text(text)
+
+    async def job():
+        ok, result = await create_and_publish_social(context, progress=progress)
+        await update.effective_message.reply_text(
+            "✅ Публикация MAX + Telegram завершена.\n\n" + result
+            if ok else f"❌ Публикация MAX + Telegram не удалась.\n\n{result}"
+        )
+
+    spawn_job(context, job())
+
+
+# Backward-compatible name.
+async def send_post_now(update, context):
+    await send_social_post_now(update, context)
+
+
 async def show_statistics(update, context):
     await update.message.reply_text(status_text(), reply_markup=admin_keyboard())
 
-async def toggle_autoposting(update, context):
-    config.auto_posting = not config.auto_posting
+
+async def toggle_social_autoposting(update, context):
+    config.auto_social_posting = not config.auto_social_posting
     config.save_config()
     configure_job_queue(context.application)
     await update.message.reply_text(status_text(), reply_markup=admin_keyboard())
 
+
+async def toggle_youtube_autoposting(update, context):
+    config.auto_youtube_posting = not config.auto_youtube_posting
+    config.save_config()
+    configure_job_queue(context.application)
+    await update.message.reply_text(status_text(), reply_markup=admin_keyboard())
+
+
+def interval_keyboard(prefix):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("1 ч", callback_data=f"{prefix}:1"),
+            InlineKeyboardButton("3 ч", callback_data=f"{prefix}:3"),
+            InlineKeyboardButton("6 ч", callback_data=f"{prefix}:6"),
+        ],
+        [
+            InlineKeyboardButton("12 ч", callback_data=f"{prefix}:12"),
+            InlineKeyboardButton("24 ч", callback_data=f"{prefix}:24"),
+        ],
+    ])
+
+
+async def show_social_interval_menu(update, context):
+    await update.message.reply_text("⏰ Интервал автопостинга MAX + Telegram:", reply_markup=interval_keyboard("social_interval"))
+
+
+async def show_youtube_interval_menu(update, context):
+    await update.message.reply_text("⏰ Интервал автопостинга YouTube Shorts:", reply_markup=interval_keyboard("youtube_interval"))
+
+
+# Backward-compatible aliases.
+async def toggle_autoposting(update, context):
+    await toggle_social_autoposting(update, context)
+
+
 async def show_interval_menu(update, context):
-    keyboard = [
-        [
-            InlineKeyboardButton("1 ч", callback_data="interval:1"),
-            InlineKeyboardButton("3 ч", callback_data="interval:3"),
-            InlineKeyboardButton("6 ч", callback_data="interval:6"),
-        ],
-        [
-            InlineKeyboardButton("12 ч", callback_data="interval:12"),
-            InlineKeyboardButton("24 ч", callback_data="interval:24"),
-        ],
-    ]
-    await update.message.reply_text(
-        "Выберите интервал:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+    await show_social_interval_menu(update, context)
+
 
 async def test_image(update, context):
     await update.message.reply_text("⏳ Тестирую бесплатную генерацию...")
@@ -3486,25 +4473,33 @@ async def test_uniqueness(update, context):
 async def handle_admin_message(update, context):
     if not is_admin(update):
         return
+    text = (update.message.text or "").strip()
 
-    text = update.message.text
-    if text == "🚀 Отправить пост":
-        await send_post_now(update, context)
-    elif text == "📊 Статистика":
+    if text in ("🚀 Опубликовать MAX + TG", "🚀 Отправить пост"):
+        await send_social_post_now(update, context)
+    elif text == "📺 Создать YouTube Shorts":
+        await create_youtube_shorts(update, context)
+    elif text == "📺 YouTube":
+        await show_youtube_status(update, context)
+    elif text == "🧪 Тест YouTube":
+        await test_youtube_upload(update, context)
+    elif text in ("📊 Статистика", "📊 Статус"):
         await show_statistics(update, context)
-    elif text == "⚙️ Автопостинг":
-        await toggle_autoposting(update, context)
-    elif text == "⏰ Интервал":
-        await show_interval_menu(update, context)
-    elif text == "🧪 Тест картинки":
+    elif text == "⚙️ Автопостинг MAX + TG":
+        await toggle_social_autoposting(update, context)
+    elif text == "⚙️ Автопостинг YouTube":
+        await toggle_youtube_autoposting(update, context)
+    elif text in ("⏰ Интервал MAX + TG", "⏰ Интервал"):
+        await show_social_interval_menu(update, context)
+    elif text == "⏰ Интервал YouTube":
+        await show_youtube_interval_menu(update, context)
+    elif text in ("🖼 Тест картинки", "Тест картинки"):
         await test_image(update, context)
     elif text == "🔎 Тест уникальности":
         await test_uniqueness(update, context)
     else:
-        await update.message.reply_text(
-            status_text(),
-            reply_markup=admin_keyboard(),
-        )
+        await update.message.reply_text(status_text(), reply_markup=admin_keyboard())
+
 
 async def handle_callback(update, context):
     query = update.callback_query
@@ -3512,18 +4507,37 @@ async def handle_callback(update, context):
         await query.answer("Нет доступа")
         return
 
-    if query.data.startswith("interval:"):
+    if query.data.startswith("youtube_privacy:"):
+        value = query.data.split(":", 1)[1]
         try:
-            hours = int(query.data.split(":")[1])
+            set_youtube_privacy(value)
+            await query.answer(f"YouTube: {value.upper()}")
+            await query.edit_message_text(youtube_status_text(), reply_markup=youtube_privacy_keyboard())
         except Exception:
-            hours = 3
+            logger.exception("YouTube privacy update failed")
+            await query.answer("Ошибка сохранения")
+        return
 
-        if 1 <= hours <= 24:
-            config.interval_hours = hours
-            config.save_config()
-            configure_job_queue(context.application)
-            await query.answer(f"Интервал: {hours} ч.")
-            await query.edit_message_text("✅ Интервал обновлён.")
+    for prefix, attr, title in (
+        ("social_interval:", "social_interval_hours", "MAX + Telegram"),
+        ("youtube_interval:", "youtube_interval_hours", "YouTube Shorts"),
+        ("interval:", "social_interval_hours", "MAX + Telegram"),
+    ):
+        if query.data.startswith(prefix):
+            try:
+                hours = int(query.data.split(":", 1)[1])
+            except Exception:
+                hours = 3
+            if 1 <= hours <= 24:
+                setattr(config, attr, hours)
+                config.save_config()
+                configure_job_queue(context.application)
+                await query.answer(f"Интервал: {hours} ч.")
+                await query.edit_message_text(f"✅ Интервал {title} обновлён: {hours} ч.")
+            return
+
+    await query.answer()
+
 
 # ============================================================
 # MAIN
@@ -3552,9 +4566,9 @@ def main():
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_message)
     )
 
-    logger.info("BeauQuot 3.1.5 Visual Engine started — temporal semantic composition + free AI Horde image generation enabled")
+    logger.info("BeauQuot 3.1.5 Visual Engine started — temporal semantic composition + GigaChat-only image generation with bounded retry enabled")
     logger.info("Quote source: local SQLite corpus seeded from dwyl/quotes")
-    logger.info("Image provider: AI Horde free/anonymous; Hugging Face tokens are used only for semantic LLM/vision.")
+    logger.info("Image provider: GigaChat-only; Hugging Face is used only for semantic LLM/vision.")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":

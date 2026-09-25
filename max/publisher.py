@@ -20,14 +20,25 @@ class MaxPublisher:
     async def publish(self,text,media_path=''):
         await self.start()
         if not self.channel_id: raise RuntimeError('MAX_CHANNEL_ID not configured')
-        kw = {'chat_id': self.channel_id,'text': text.strip()}
+        kw = {
+            'chat_id': self.channel_id,
+            'text': text.strip(),
+        }
+
         if media_path and Path(media_path).is_file():
             suffix = Path(media_path).suffix.lower()
+
             if suffix == '.mp4':
-                if Video is None: raise RuntimeError('pymax.Video is unavailable; cannot publish animated video')
+                if Video is None:
+                    raise RuntimeError(
+                        'pymax.Video is unavailable; cannot publish animated video'
+                    )
                 attachment = Video(path=str(media_path))
-            else: attachment = Photo(path=str(media_path))
+            else:
+                attachment = Photo(path=str(media_path))
+
             kw['attachments'] = [attachment]
+
         msg = await self.client.send_message(**kw)
         return getattr(msg,'id',msg)
     async def close(self):
